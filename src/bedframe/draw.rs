@@ -727,39 +727,54 @@ impl DrawList {
         radius: f32,
         uv_max: (f32, f32),
     ) {
+        self.image_uv_rect(rect, texture, tint, radius, (0.0, 0.0, uv_max.0, uv_max.1));
+    }
+
+    /// Like [`DrawList::image_rounded_uv`], but the texture rectangle
+    /// `(u0, v0)..(u1, v1)` fills `rect`. A caller that wants the least
+    /// possible crop can centre the rectangle on the source and keep the
+    /// quad's aspect, so nothing is stretched.
+    pub fn image_uv_rect(
+        &mut self,
+        rect: Rect,
+        texture: &Arc<GpuTexture>,
+        tint: Color,
+        radius: f32,
+        uv: (f32, f32, f32, f32),
+    ) {
         if tint.a == 0 || rect.w <= 0.0 || rect.h <= 0.0 || self.culled(rect) {
             return;
         }
         let r = radius.clamp(0.0, (rect.w * 0.5).min(rect.h * 0.5));
         let params = [rect.w, rect.h, r, 2.0];
         let c = tint.to_array();
-        let (u, v) = uv_max;
+        let (u0, v0, u1, v1) = uv;
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&[
             UiVertex {
                 pos: [rect.x, rect.y],
-                uv: [0.0, 0.0],
+                uv: [u0, v0],
                 color: c,
                 params,
                 extra: QUAD_EXTRA,
             },
             UiVertex {
                 pos: [rect.x + rect.w, rect.y],
-                uv: [u, 0.0],
+                uv: [u1, v0],
                 color: c,
                 params,
                 extra: QUAD_EXTRA,
             },
             UiVertex {
                 pos: [rect.x + rect.w, rect.y + rect.h],
-                uv: [u, v],
+                uv: [u1, v1],
                 color: c,
                 params,
                 extra: QUAD_EXTRA,
             },
             UiVertex {
                 pos: [rect.x, rect.y + rect.h],
-                uv: [0.0, v],
+                uv: [u0, v1],
                 color: c,
                 params,
                 extra: QUAD_EXTRA,
