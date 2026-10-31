@@ -138,52 +138,17 @@ impl ModelGpu {
         let mut meshes = Vec::with_capacity(model.meshes.len());
         for (mesh_index, mesh) in model.meshes.iter().enumerate() {
             let skinned = mesh.is_skinned();
-            // Normalize weights so the shader's blend is well-defined.
-            let vertices: Vec<u8> = if skinned {
-                mesh.positions
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(index, &position)| {
-                        let joints = mesh.joints.get(index).copied().unwrap_or([0; 4]);
-                        let mut weights = mesh
-                            .weights
-                            .get(index)
-                            .copied()
-                            .unwrap_or([1.0, 0.0, 0.0, 0.0]);
-                        let sum: f32 = weights.iter().sum();
-                        if sum > 1e-6 {
-                            for weight in &mut weights {
-                                *weight /= sum;
-                            }
-                        } else {
-                            weights = [1.0, 0.0, 0.0, 0.0];
-                        }
-                        bytemuck::bytes_of(&SkinnedVertex {
-                            position,
-                            normal: mesh.normals.get(index).copied().unwrap_or([0.0, 1.0, 0.0]),
-                            uv: mesh.uvs.get(index).copied().unwrap_or([0.0, 0.0]),
-                            joints,
-                            weights,
-                        })
-                        .to_vec()
-                    })
-                    .collect()
+            let label = format!("model mesh {}", mesh.name);
+            // One interleaved buffer, cast once. The per-vertex
+            // `bytes_of(..).to_vec()` this replaced allocated a Vec for
+            // every vertex in the mesh.
+            let vertex_buffer = if skinned {
+                let vertices = skinned_vertices(mesh);
+                ctx.create_vertex_buffer(&label, bytemuck::cast_slice(&vertices))
             } else {
-                mesh.positions
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(index, &position)| {
-                        bytemuck::bytes_of(&ModelVertex {
-                            position,
-                            normal: mesh.normals.get(index).copied().unwrap_or([0.0, 1.0, 0.0]),
-                            uv: mesh.uvs.get(index).copied().unwrap_or([0.0, 0.0]),
-                        })
-                        .to_vec()
-                    })
-                    .collect()
+                let vertices = static_vertices(mesh);
+                ctx.create_vertex_buffer(&label, bytemuck::cast_slice(&vertices))
             };
-            let vertex_buffer =
-                ctx.create_vertex_buffer(&format!("model mesh {}", mesh.name), &vertices);
             let index_bytes: Vec<u8> = mesh
                 .indices
                 .iter()
@@ -218,6 +183,65 @@ impl ModelGpu {
     pub fn mesh_count(&self) -> usize {
         self.meshes.len()
     }
+}
+
+/// Interleaved static vertices for `mesh` (missing normal/uv take defaults).
+fn static_vertices(mesh: &super::Mesh) -> Vec<ModelVertex> {
+    let mut vertices = Vec::with_capacity(mesh.positions.len());
+    for (index, &position) in mesh.positions.iter().enumerate() {
+        vertices.push(ModelVertex {
+            position,
+            normal: mesh.normals.get(index).copied().unwrap_or([0.0, 1.0, 0.0]),
+            uv: mesh.uvs.get(index).copied().unwrap_or([0.0, 0.0]),
+        });
+    }
+    vertices
+}
+
+/// Interleaved skinned vertices. Weights are normalized so the shader's
+/// blend is well-defined; a zero-weight vertex falls back to joint 0.
+fn skinned_vertices(mesh: &super::Mesh) -> Vec<SkinnedVertex> {
+    let mut vertices = Vec::with_capacity(mesh.positions.len());
+    for (index, &position) in mesh.positions.iter().enumerate() {
+        let joints = mesh.joints.get(index).copied().unwrap_or([0; 4]);
+        let mut weights = mesh
+            .weights
+            .get(index)
+            .copied()
+            .unwrap_or([1.0, 0.0, 0.0, 0.0]);
+        let sum: f32 = weights.iter().sum();
+        if sum > 1e-6 {
+            for weight in &mut weights {
+                *weight /= sum;
+            }
+        } else {
+            weights = [1.0, 0.0, 0.0, 0.0];
+        }
+        vertices.push(SkinnedVertex {
+            position,
+            normal: mesh.normals.get(index).copied().unwrap_or([0.0, 1.0, 0.0]),
+            uv: mesh.uvs.get(index).copied().unwrap_or([0.0, 0.0]),
+            joints,
+            weights,
+        });
+    }
+    vertices
+}
+
+/// Interleaved PBR vertices (uv1 + tangents; missing attributes emit the
+/// fallbacks the shader understands).
+fn pbr_vertices(mesh: &super::Mesh) -> Vec<PbrVertex> {
+    let mut vertices = Vec::with_capacity(mesh.positions.len());
+    for (index, &position) in mesh.positions.iter().enumerate() {
+        vertices.push(PbrVertex {
+            position,
+            normal: mesh.normals.get(index).copied().unwrap_or([0.0, 1.0, 0.0]),
+            uv0: mesh.uvs.get(index).copied().unwrap_or([0.0, 0.0]),
+            uv1: mesh.uvs1.get(index).copied().unwrap_or([0.0, 0.0]),
+            tangent: mesh.tangents.get(index).copied().unwrap_or([0.0; 4]),
+        });
+    }
+    vertices
 }
 
 /// Per-frame-slot joint ring: one host buffer, dynamic offsets per draw.
@@ -898,6 +922,54 @@ mod tests {
         // 32 + uv1 (8) + tangent (16).
         assert_eq!(std::mem::size_of::<PbrVertex>(), 56);
         assert_eq!(std::mem::size_of::<MaterialFactors>(), 13 * 16);
+    }
+
+    /// The three interleaved builders share the old per-vertex output but
+    /// fill defaults without allocating per vertex.
+    #[test]
+    fn vertex_packers_fill_defaults_and_normalize_weights() {
+        let mesh = crate::model::Mesh {
+            name: "pack".into(),
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
+            normals: vec![[0.0, 0.0, 1.0]],
+            uvs: Vec::new(),
+            uvs1: Vec::new(),
+            tangents: Vec::new(),
+            joints: vec![[1, 2, 3, 4]],
+            weights: vec![[2.0, 2.0, 0.0, 0.0], [0.0; 4]],
+            indices: vec![0, 1, 2],
+            material: 0,
+            node: None,
+        };
+
+        let statics = static_vertices(&mesh);
+        assert_eq!(statics.len(), 3);
+        assert_eq!(statics[0].normal, [0.0, 0.0, 1.0]);
+        assert_eq!(statics[1].normal, [0.0, 1.0, 0.0], "default normal");
+        assert_eq!(statics[1].uv, [0.0, 0.0], "default uv");
+        assert_eq!(
+            bytemuck::cast_slice::<ModelVertex, u8>(&statics).len(),
+            3 * 32
+        );
+
+        let skinned = skinned_vertices(&mesh);
+        assert_eq!(skinned[0].joints, [1, 2, 3, 4]);
+        assert_eq!(skinned[0].weights, [0.5, 0.5, 0.0, 0.0]);
+        assert_eq!(
+            skinned[1].weights,
+            [1.0, 0.0, 0.0, 0.0],
+            "zero weights fall back to joint 0"
+        );
+        assert_eq!(skinned[2].joints, [0; 4], "missing joints default");
+        assert_eq!(
+            bytemuck::cast_slice::<SkinnedVertex, u8>(&skinned).len(),
+            3 * 56
+        );
+
+        let pbr = pbr_vertices(&mesh);
+        assert_eq!(pbr[0].uv1, [0.0, 0.0]);
+        assert_eq!(pbr[0].tangent, [0.0; 4]);
+        assert_eq!(bytemuck::cast_slice::<PbrVertex, u8>(&pbr).len(), 3 * 56);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::pipeline::create_pbr_pipeline;
-use super::{MaterialFactors, PbrMaterialGpu, PbrState, PbrVertex, scene_set_layout};
+use super::{MaterialFactors, PbrMaterialGpu, PbrState, scene_set_layout};
 use crate::gfx::vulkan::GpuContext;
 use crate::model::Material;
 use crate::texture::{self, GpuTexture, TextureFormat, TextureOptions};
@@ -15,22 +15,12 @@ pub(crate) fn pbr_vertex_buffer(
     ctx: &Arc<GpuContext>,
     mesh: &crate::model::Mesh,
 ) -> crate::gfx::GpuBuffer {
-    let vertices: Vec<u8> = mesh
-        .positions
-        .iter()
-        .enumerate()
-        .flat_map(|(index, &position)| {
-            bytemuck::bytes_of(&PbrVertex {
-                position,
-                normal: mesh.normals.get(index).copied().unwrap_or([0.0, 1.0, 0.0]),
-                uv0: mesh.uvs.get(index).copied().unwrap_or([0.0, 0.0]),
-                uv1: mesh.uvs1.get(index).copied().unwrap_or([0.0, 0.0]),
-                tangent: mesh.tangents.get(index).copied().unwrap_or([0.0; 4]),
-            })
-            .to_vec()
-        })
-        .collect();
-    ctx.create_vertex_buffer(&format!("model pbr mesh {}", mesh.name), &vertices)
+    // One interleaved buffer, cast once (no per-vertex Vec).
+    let vertices = super::pbr_vertices(mesh);
+    ctx.create_vertex_buffer(
+        &format!("model pbr mesh {}", mesh.name),
+        bytemuck::cast_slice(&vertices),
+    )
 }
 
 /// One material map: real pixels when present, else a neutral 1x1 that is
