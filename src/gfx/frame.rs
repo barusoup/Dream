@@ -1,5 +1,7 @@
 use super::acquire::AcquireOutcome;
-use super::pipeline::{attachment, depth_attachment, general_barrier, make_viewport, scene_region};
+use super::pipeline::{
+    attachment, depth_attachment, general_barrier, make_viewport, map_surface_error, scene_region,
+};
 use super::timing::elapsed_timestamp_ticks;
 use super::vulkan;
 use super::{DrawCtx, FramePhases, Renderer, SurfaceError};
@@ -540,10 +542,14 @@ impl Renderer {
             {
                 let mark = Instant::now();
                 let _queue = self.ctx.queue_lock.lock().unwrap();
+                // Present reports the same resize/loss conditions as
+                // acquire: `OUT_OF_DATE` means the surface moved on while
+                // this frame was recorded, so callers must be able to resize
+                // and retry rather than see an undiagnosable `Other`.
                 self.ctx
                     .swapchain_loader
                     .queue_present(self.ctx.queue(), &present)
-                    .map_err(|_| SurfaceError::Other)?;
+                    .map_err(map_surface_error)?;
                 self.phases.present_us = mark.elapsed().as_secs_f32() * 1e6;
             }
             // Request the next acquire only AFTER presenting. The image this

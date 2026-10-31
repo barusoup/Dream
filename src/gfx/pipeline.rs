@@ -389,7 +389,9 @@ pub(super) fn new_fence(ctx: &GpuContext) -> vk::Fence {
     .expect("create fence")
 }
 
-pub(super) fn map_acquire_error(err: vk::Result) -> SurfaceError {
+/// Classify a swapchain-path `VkResult` (acquire or present) so callers see
+/// the resize/loss signals the presentation engine actually reported.
+pub(super) fn map_surface_error(err: vk::Result) -> SurfaceError {
     match err {
         vk::Result::ERROR_OUT_OF_DATE_KHR => SurfaceError::Outdated,
         vk::Result::ERROR_SURFACE_LOST_KHR => SurfaceError::Lost,

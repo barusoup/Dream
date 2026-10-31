@@ -14,7 +14,7 @@
 //! the wait -- finished.
 
 use super::SurfaceError;
-use super::pipeline::map_acquire_error;
+use super::pipeline::map_surface_error;
 use super::vulkan::GpuContext;
 use crate::threads::{ShutdownToken, Worker};
 use ash::vk;
@@ -151,7 +151,7 @@ impl AcquireWorker {
                 // signalled, so trying again is legal.
                 Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => continue,
                 Err(err) => {
-                    let _ = tx.send(Err(map_acquire_error(err)));
+                    let _ = tx.send(Err(map_surface_error(err)));
                     return;
                 }
             }

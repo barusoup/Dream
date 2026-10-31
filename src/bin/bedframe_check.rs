@@ -732,6 +732,67 @@ fn ink_bounds(
     (min_x != u32::MAX).then_some((min_x, max_x, min_y, max_y))
 }
 
+/// Point the swapchain at the window's current size, if it has moved on.
+fn resize_to_window(renderer: &mut Renderer, window: Option<&Window>, label: &str) {
+    let Some(window) = window else {
+        panic!("{label}: swapchain went stale with no window to resize from");
+    };
+    let size = window.inner_size();
+    let (width, height) = renderer.display_size();
+    eprintln!(
+        "[check] {label}: swapchain {width}x{height} stale, rebuilding at {}x{}",
+        size.width, size.height
+    );
+    renderer.resize(size);
+}
+
+/// Render `frame`, rebuilding the swapchain if the surface reported that it
+/// went stale. A resize can land after recording started — X11 applies one
+/// asynchronously, and a hidden window gets no chance to react first — so a
+/// present at the old extent reports `Outdated`. One retry at the window's
+/// actual size settles it; any other error, or a second stale report, is real.
+fn render_settled<F>(
+    renderer: &mut Renderer,
+    window: Option<&Window>,
+    label: &str,
+    draw: F,
+    frame: &UiFrame,
+) -> usize
+where
+    F: for<'a> Fn(&mut dream::gfx::DrawCtx<'a>) -> usize + Copy,
+{
+    let camera = Camera::default();
+    match renderer.render_ui(&camera, None, draw, Some(frame)) {
+        Ok(visible) => visible,
+        Err(dream::gfx::SurfaceError::Outdated) => {
+            resize_to_window(renderer, window, label);
+            renderer
+                .render_ui(&camera, None, draw, Some(frame))
+                .unwrap_or_else(|err| panic!("{label}: {err:?} after rebuilding the swapchain"))
+        }
+        Err(err) => panic!("{label}: {err:?}"),
+    }
+}
+
+/// [`Renderer::render_ui_only`] with the same stale-swapchain retry.
+fn render_only_settled(
+    renderer: &mut Renderer,
+    window: Option<&Window>,
+    label: &str,
+    frame: &UiFrame,
+) {
+    match renderer.render_ui_only(Some(frame)) {
+        Ok(()) => {}
+        Err(dream::gfx::SurfaceError::Outdated) => {
+            resize_to_window(renderer, window, label);
+            renderer
+                .render_ui_only(Some(frame))
+                .unwrap_or_else(|err| panic!("{label}: {err:?} after rebuilding the swapchain"));
+        }
+        Err(err) => panic!("{label}: {err:?}"),
+    }
+}
+
 impl Check {
     /// Run one scripted step: build, render, capture, assert, screenshot.
     fn run_step(&mut self, event_loop: &ActiveEventLoop) {
@@ -756,20 +817,35 @@ impl Check {
             // The resize arrived and `resize` already ran on the event.
             self.resize_pending = None;
         }
+        // An unsolicited or late resize (a window manager, or X11 applying
+        // the request after this step began) must not leave the frame built
+        // for an extent the surface no longer has: rebuild before the frame
+        // is built, so every assert below probes the pixels just presented.
+        if let Some(window) = self.window.as_deref() {
+            let size = window.inner_size();
+            if size.width > 0
+                && size.height > 0
+                && (size.width, size.height) != renderer.display_size()
+            {
+                resize_to_window(renderer, Some(window), "step start");
+            }
+        }
         let display = renderer.display_size();
         let logical = (display.0 as f32 / step.scale, display.1 as f32 / step.scale);
         match step.extra {
             Some(Extra::Unicode) => {
                 blocking_before = renderer.context().blocking_submissions();
                 let frame = build_frame(ui, step.scale, logical, texture, step.text);
-                let camera = Camera::default();
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame))
-                    .expect("render unicode frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render unicode frame",
+                    |_| 0,
+                    &frame,
+                );
                 ui.recycle_frame(frame);
             }
             Some(Extra::DropFrame) => {
-                let camera = Camera::default();
                 // A custom texture (same magenta as the check texel, so
                 // the image asserts still hold) whose last `Arc` dies the
                 // instant `render_ui` returns — the slot's retained list
@@ -795,9 +871,13 @@ impl Check {
                 // The deliberate one-shot texture upload above already
                 // counted; measure only the render itself.
                 blocking_before = renderer.context().blocking_submissions();
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame))
-                    .expect("render drop frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render drop frame",
+                    |_| 0,
+                    &frame,
+                );
                 drop(frame);
                 drop(temporary);
             }
@@ -838,20 +918,26 @@ impl Check {
                     },
                     pixels: vec![255, 0, 255, 255],
                 });
-                let camera = Camera::default();
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame))
-                    .expect("render raw legacy upload");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render raw legacy upload",
+                    |_| 0,
+                    &frame,
+                );
             }
             Some(Extra::Orient) => {
                 blocking_before = renderer.context().blocking_submissions();
                 // The label "Fp g" — orientation asserts below compare
                 // ink structure inside the glyph region.
                 let frame = build_frame(ui, step.scale, logical, texture, step.text);
-                let camera = Camera::default();
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame))
-                    .expect("render orientation frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render orientation frame",
+                    |_| 0,
+                    &frame,
+                );
                 ui.recycle_frame(frame);
             }
             Some(Extra::AtlasReset) => {
@@ -861,17 +947,24 @@ impl Check {
                 // resets (overflow path or explicit), bumping the epoch.
                 // The retained frame's old pages must still be valid.
                 let frame_a = build_frame(ui, step.scale, logical, texture, "BedFrame OK");
-                let camera = Camera::default();
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame_a))
-                    .expect("render frame A");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render frame A",
+                    |_| 0,
+                    &frame_a,
+                );
                 self.retained_frame = Some(frame_a);
                 // Frame B introduces unseen glyphs and renders over the
                 // retained page textures.
                 let frame_b = build_frame(ui, step.scale, logical, texture, "Zx9@#~");
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame_b))
-                    .expect("render frame B");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render frame B",
+                    |_| 0,
+                    &frame_b,
+                );
                 ui.recycle_frame(frame_b);
                 // Reset through the Ui path: new epoch, both glyph maps
                 // cleared, layout cache invalidated — then re-render the
@@ -879,17 +972,24 @@ impl Check {
                 // (epoch change) and draw correctly.
                 ui.cache_mut().reset_atlas();
                 let frame_a = self.retained_frame.take().expect("retained frame A");
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame_a))
-                    .expect("re-render retained frame A after reset");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "re-render retained frame A after reset",
+                    |_| 0,
+                    &frame_a,
+                );
             }
             Some(Extra::CompactVsLegacy) => {
                 blocking_before = renderer.context().blocking_submissions();
                 let frame = build_frame(ui, step.scale, logical, texture, step.text);
-                let camera = Camera::default();
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame))
-                    .expect("render compact frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render compact frame",
+                    |_| 0,
+                    &frame,
+                );
                 assert_eq!(
                     renderer.context().blocking_submissions(),
                     blocking_before,
@@ -900,9 +1000,13 @@ impl Check {
                 let before_legacy = renderer.context().blocking_submissions();
                 renderer.set_ui_instancing(false);
                 let frame = build_frame(ui, step.scale, logical, texture, step.text);
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame))
-                    .expect("render legacy-geometry frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render legacy-geometry frame",
+                    |_| 0,
+                    &frame,
+                );
                 assert_eq!(
                     renderer.context().blocking_submissions(),
                     before_legacy,
@@ -918,9 +1022,12 @@ impl Check {
             Some(Extra::UiOnlyBeforeScene) => {
                 blocking_before = renderer.context().blocking_submissions();
                 let frame = build_frame(ui, step.scale, logical, texture, step.text);
-                renderer
-                    .render_ui_only(Some(&frame))
-                    .expect("render ui-only frame");
+                render_only_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render ui-only frame",
+                    &frame,
+                );
                 assert!(
                     !renderer.has_temporal(),
                     "AaMode::None builds no temporal upscaler"
@@ -928,25 +1035,26 @@ impl Check {
                 ui.recycle_frame(frame);
             }
             Some(Extra::UiOnlyAfterScene) => {
-                let camera = Camera::default();
                 let warm = build_frame(ui, step.scale, logical, texture, step.text);
-                renderer
-                    .render_ui(
-                        &camera,
-                        None,
-                        |draw| {
-                            let _ = draw.raw();
-                            0
-                        },
-                        Some(&warm),
-                    )
-                    .expect("warm scene frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "warm scene frame",
+                    |draw| {
+                        let _ = draw.raw();
+                        0
+                    },
+                    &warm,
+                );
                 ui.recycle_frame(warm);
                 let warmed = renderer.context().blocking_submissions();
                 let frame = build_frame(ui, step.scale, logical, texture, step.text);
-                renderer
-                    .render_ui_only(Some(&frame))
-                    .expect("ui-only after scene");
+                render_only_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "ui-only after scene",
+                    &frame,
+                );
                 assert_eq!(
                     renderer.context().blocking_submissions(),
                     warmed,
@@ -965,17 +1073,16 @@ impl Check {
                 );
                 let after_ui_capture = renderer.context().blocking_submissions();
                 let frame = build_frame(ui, step.scale, logical, texture, step.text);
-                renderer
-                    .render_ui(
-                        &camera,
-                        None,
-                        |draw| {
-                            let _ = draw.raw();
-                            0
-                        },
-                        Some(&frame),
-                    )
-                    .expect("scene resume frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "scene resume frame",
+                    |draw| {
+                        let _ = draw.raw();
+                        0
+                    },
+                    &frame,
+                );
                 assert_eq!(
                     renderer.context().blocking_submissions(),
                     after_ui_capture,
@@ -1000,21 +1107,23 @@ impl Check {
                     ui.end()
                 };
                 let frame = opaque_frame(ui);
-                renderer
-                    .render_ui(
-                        &camera,
-                        None,
-                        |draw| {
-                            let _ = draw.raw();
-                            0
-                        },
-                        Some(&frame),
-                    )
-                    .expect("legacy opaque frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "legacy opaque frame",
+                    |draw| {
+                        let _ = draw.raw();
+                        0
+                    },
+                    &frame,
+                );
                 let (legacy_px, lw, lh) = renderer.capture_rgba8();
-                renderer
-                    .render_ui_only(Some(&frame))
-                    .expect("ui-only opaque frame");
+                render_only_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "ui-only opaque frame",
+                    &frame,
+                );
                 let (only_px, ow, oh) = renderer.capture_rgba8();
                 assert_eq!((lw, lh), (ow, oh));
                 let worst = legacy_px
@@ -1028,9 +1137,12 @@ impl Check {
                     "opaque UI: legacy vs ui-only differ by {worst} LSB"
                 );
                 let frame = build_frame(ui, step.scale, logical, texture, step.text);
-                renderer
-                    .render_ui_only(Some(&frame))
-                    .expect("final ui-only frame");
+                render_only_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "final ui-only frame",
+                    &frame,
+                );
                 ui.recycle_frame(frame);
                 blocking_before = renderer.context().blocking_submissions();
             }
@@ -1040,20 +1152,26 @@ impl Check {
                 // get probed after the capture.
                 blocking_before = renderer.context().blocking_submissions();
                 let frame = build_frame(ui, step.scale, logical, texture, step.text);
-                let camera = Camera::default();
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame))
-                    .expect("render primitives frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render primitives frame",
+                    |_| 0,
+                    &frame,
+                );
                 ui.recycle_frame(frame);
             }
             Some(Extra::Gallery(light)) => {
                 blocking_before = renderer.context().blocking_submissions();
                 let frame = build_gallery_frame(ui, step.scale, light);
                 let _ = &frame;
-                let camera = Camera::default();
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame))
-                    .expect("render gallery frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render gallery frame",
+                    |_| 0,
+                    &frame,
+                );
                 ui.recycle_frame(frame);
             }
             Some(Extra::GalleryDevtools) => {
@@ -1061,19 +1179,25 @@ impl Check {
                 ui.set_devtools(dream::ui::devtools::DevtoolsMode::Outlines);
                 let frame = build_gallery_frame(ui, step.scale, false);
                 ui.set_devtools(dream::ui::devtools::DevtoolsMode::Off);
-                let camera = Camera::default();
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame))
-                    .expect("render devtools frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render devtools frame",
+                    |_| 0,
+                    &frame,
+                );
                 ui.recycle_frame(frame);
             }
             None => {
                 blocking_before = renderer.context().blocking_submissions();
                 let frame = build_frame(ui, step.scale, logical, texture, step.text);
-                let camera = Camera::default();
-                renderer
-                    .render_ui(&camera, None, |_| 0, Some(&frame))
-                    .expect("render ui frame");
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render ui frame",
+                    |_| 0,
+                    &frame,
+                );
                 ui.recycle_frame(frame);
             }
         }
@@ -1791,9 +1915,10 @@ impl ApplicationHandler for Check {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                if self.resize_pending.is_some()
-                    && let Some(renderer) = self.renderer.as_mut()
-                {
+                // Every resize, not just one this harness asked for: the
+                // window manager can change the size at any time, and the
+                // swapchain must follow before the next present.
+                if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
                     if let Some(window) = &self.window {
                         window.request_redraw();
