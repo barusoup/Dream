@@ -122,6 +122,10 @@ struct Voice {
     /// Fade-in progress, seconds remaining.
     fade_in_left: f32,
     fade_in_total: f32,
+    /// Length of a running fade-out, in frames. The envelope divides the
+    /// remaining frames by this fixed length, so the ramp stays continuous
+    /// across `mix_into` blocks instead of restarting at unity each block.
+    fade_out_total: u64,
     state: VoiceState,
     generation: u32,
     /// Start order, for oldest-voice stealing.
@@ -143,6 +147,7 @@ impl Voice {
             max_distance: 64.0,
             fade_in_left: 0.0,
             fade_in_total: 0.0,
+            fade_out_total: 0,
             state: VoiceState::Dead,
             generation: 0,
             order: 0,
@@ -220,6 +225,7 @@ impl Mixer {
             max_distance: params.max_distance.max(0.02),
             fade_in_left: fade_in_total,
             fade_in_total,
+            fade_out_total: 0,
             state: VoiceState::Playing,
             generation,
             order: self.next_order,
@@ -237,9 +243,24 @@ impl Mixer {
         let sample_rate = self.sample_rate;
         if let Some(voice) = self.voice_mut(handle) {
             voice.state = match fade_out {
-                Some(seconds) if seconds > 0.0 => VoiceState::Stopping {
-                    frames_left: (seconds * sample_rate as f32) as u64,
-                },
+                Some(seconds) if seconds > 0.0 => {
+                    // At least one frame, or the ramp has no length to
+                    // measure its envelope against.
+                    let frames = ((seconds * sample_rate as f32) as u64).max(1);
+                    // Re-stopping a voice that is already fading keeps the
+                    // envelope where it is: the remaining time is rescaled
+                    // to the new ramp length instead of jumping back to
+                    // unity, which would click.
+                    let frames_left = match voice.state {
+                        VoiceState::Stopping { frames_left } if voice.fade_out_total > 0 => {
+                            let fraction = frames_left as f64 / voice.fade_out_total as f64;
+                            ((fraction * frames as f64).round() as u64).clamp(1, frames)
+                        }
+                        _ => frames,
+                    };
+                    voice.fade_out_total = frames;
+                    VoiceState::Stopping { frames_left }
+                }
                 _ => VoiceState::Dead,
             };
         }
@@ -332,11 +353,13 @@ impl Mixer {
             let base_gain = voice.gain * spatial_gain * bus;
             let (left_pan, right_pan) = (left_pan * spatial_left, right_pan * spatial_right);
 
-            let mut fade_out_gain = 1.0f32;
             let mut fade_frames_left = u64::MAX;
             if let VoiceState::Stopping { frames_left } = voice.state {
                 fade_frames_left = frames_left;
             }
+            // The fixed ramp length (never the remaining frames, which would
+            // reset the envelope to 1.0 at every block boundary).
+            let fade_total = voice.fade_out_total.max(1) as f32;
 
             let mut mixed = 0u64;
             for frame in 0..frames {
@@ -349,9 +372,7 @@ impl Mixer {
                         (voice.fade_in_left - 1.0 / self.sample_rate as f32).max(0.0);
                 }
                 if fade_frames_left != u64::MAX {
-                    envelope *= (fade_frames_left as f32 / (voice.fade_out_frames().max(1) as f32))
-                        .clamp(0.0, 1.0);
-                    fade_out_gain = envelope;
+                    envelope *= (fade_frames_left as f32 / fade_total).clamp(0.0, 1.0);
                 }
                 let gain = base_gain * envelope;
                 if gain <= 0.0 && fade_frames_left != u64::MAX {
@@ -386,7 +407,6 @@ impl Mixer {
                 let left = frames_left.saturating_sub(mixed.min(frames_left));
                 voice.state = VoiceState::Stopping { frames_left: left };
             }
-            let _ = fade_out_gain;
             let _ = mixed;
         }
         self.mixed_frames += frames as u64;
@@ -430,17 +450,6 @@ impl Mixer {
         self.stolen += 1;
         let generation = self.voices[oldest].generation.wrapping_add(1);
         (oldest, generation.max(1))
-    }
-}
-
-impl Voice {
-    /// Frames a stopping voice has left to fade, approximated from its gain
-    /// (used only for the fade envelope denominator).
-    fn fade_out_frames(&self) -> u64 {
-        match self.state {
-            VoiceState::Stopping { frames_left } => frames_left.max(1),
-            _ => 1,
-        }
     }
 }
 
@@ -685,6 +694,46 @@ mod tests {
             "fades toward silence: {} vs {}",
             out[0],
             out[40]
+        );
+    }
+
+    #[test]
+    fn stop_fade_keeps_ramping_across_blocks() {
+        let mut m = Mixer::new(1_000);
+        // 100 frames of fade, mixed in 32-frame blocks: frame i of the ramp
+        // carries gain (100 - i) / 100. A per-block denominator would
+        // restart block two at unity — an audible click.
+        let handle = m.play(clip(4_000, 1_000, 1.0), PlayParams::default());
+        m.stop(handle, Some(0.1));
+        let mut first = vec![0.0; 32 * 2];
+        m.mix_into(&mut first);
+        let mut second = vec![0.0; 32 * 2];
+        m.mix_into(&mut second);
+        assert!((first[0] - 1.0).abs() < 1e-3, "starts at full gain");
+        assert!((first[30 * 2] - 0.70).abs() < 1e-3, "ramps down");
+        assert!(
+            (second[0] - 0.68).abs() < 1e-3,
+            "continues the ramp across the block boundary, got {}",
+            second[0]
+        );
+        assert!(second[0] < first[30 * 2], "envelope never jumps back up");
+    }
+
+    #[test]
+    fn restarting_a_stop_fade_keeps_the_envelope_continuous() {
+        let mut m = Mixer::new(1_000);
+        let handle = m.play(clip(4_000, 1_000, 1.0), PlayParams::default());
+        m.stop(handle, Some(0.1)); // 100 frames
+        let mut first = vec![0.0; 64 * 2];
+        m.mix_into(&mut first);
+        // 64 frames consumed: the envelope sits at 36/100.
+        m.stop(handle, Some(0.1));
+        let mut second = vec![0.0; 32 * 2];
+        m.mix_into(&mut second);
+        assert!(
+            (second[0] - 0.36).abs() < 1e-3,
+            "re-stop keeps the envelope continuous, got {}",
+            second[0]
         );
     }
 
