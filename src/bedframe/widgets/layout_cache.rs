@@ -10,16 +10,24 @@
 //! needs one. Hash-only equality is never trusted; a bucket holds every
 //! field that decides the layout and compares all of them.
 //!
-//! Bounds are fixed: 1024 entries and a 2 MiB retained-payload cap, LRU
+//! Bounds are fixed: 2048 entries and a 2 MiB retained-payload cap, LRU
 //! eviction. An oversized layout is drawn but not admitted. The cap is
 //! admission-side, not a live-memory guarantee: `Arc`s held by a finished
 //! frame keep their layout alive outside the budget.
+//!
+//! The entry bound tracks the byte bound rather than undercutting it. A
+//! typical label layout retains about 1 KiB, so 1024 entries capped the
+//! cache near 1 MiB and left half of the 2 MiB payload budget unused. That
+//! mattered for dense screens: a 1236-layout frame overflowed 1024 slots,
+//! and LRU then evicted exactly the entries the next frame would ask for
+//! first, so every layout was rebuilt every frame. 2048 slots let the byte
+//! cap decide eviction for layouts of ordinary size.
 
 use super::super::font::{Align, FontId, TextLayout};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const MAX_ENTRIES: usize = 1024;
+const MAX_ENTRIES: usize = 2048;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -445,6 +453,29 @@ mod tests {
         assert!(cache.get(&request("s0", 128)).is_some(), "hit survives");
         assert!(cache.get(&request("s1", 128)).is_none(), "eldest evicted");
         assert!(cache.get(&request("new", 128)).is_some());
+    }
+
+    /// A dense frame of distinct labels must stay cached: 1236 layouts is
+    /// above the old 1024-entry bound, where LRU evicted exactly the
+    /// entries the next frame asked for first, so every layout was rebuilt
+    /// every frame.
+    #[test]
+    fn layout_cache_dense_working_set_does_not_thrash() {
+        let mut cache = LayoutCache::default();
+        let texts: Vec<String> = (0..1236).map(|i| format!("Row {i:04}")).collect();
+        for text in &texts {
+            cache.insert(&request(text, 128), layout());
+        }
+        assert_eq!(cache.entries, texts.len());
+        for text in &texts {
+            assert!(
+                cache.get(&request(text, 128)).is_some(),
+                "{text} was evicted before its next use"
+            );
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.hits as usize, texts.len());
     }
 
     #[test]
