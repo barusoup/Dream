@@ -1,8 +1,7 @@
 <p align="center">
   <img src="assets/branding/dream_icon.png" width="160" alt="Dream Engine logo">
+  <h1>Dream Engine</h1>
 </p>
-
-# Dream Engine
 
 A Rust game engine that doubles as an app framework. It includes BedFrame, a UI framework for apps and HUDs, and aims to be a working alternative to React-based app frameworks and to engines like Godot and Unity.
 
