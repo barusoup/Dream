@@ -14,13 +14,24 @@ const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 const MAX_STORED: usize = 0xffff;
 
 /// Encode 8-bit RGBA pixels (row-major, top row first) as a PNG file.
+/// A zero width or height has no pixels and no legal PNG representation, so
+/// it encodes to an empty vector instead of panicking.
 pub fn encode(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
-    let stride = width as usize * 4;
+    let texels = (width as usize)
+        .checked_mul(height as usize)
+        .expect("image dimensions overflow addressable memory");
+    let expected = texels
+        .checked_mul(4)
+        .expect("image dimensions overflow addressable memory");
     assert_eq!(
         rgba.len(),
-        stride * height as usize,
+        expected,
         "pixel buffer must be width*height*4 bytes"
     );
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let stride = width as usize * 4;
 
     let mut out = Vec::with_capacity(rgba.len() + rgba.len() / MAX_STORED * 5 + 128);
     out.extend_from_slice(&SIGNATURE);
@@ -42,8 +53,16 @@ pub fn encode(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Write 8-bit RGBA pixels to `path` as a PNG.
+/// Write 8-bit RGBA pixels to `path` as a PNG. A zero width or height is
+/// rejected before the file is created, so a failed capture never leaves an
+/// empty image behind.
 pub fn write(path: &Path, width: u32, height: u32, rgba: &[u8]) -> io::Result<()> {
+    if width == 0 || height == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PNG capture needs a non-zero width and height",
+        ));
+    }
     let bytes = encode(width, height, rgba);
     std::fs::File::create(path)?.write_all(&bytes)
 }
@@ -108,5 +127,36 @@ impl Crc32 {
 
     fn finish(self) -> u32 {
         !self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_round_trips_through_the_image_crate() {
+        let pixels = [255u8, 0, 0, 255, 0, 255, 0, 255];
+        let png = encode(2, 1, &pixels);
+        let decoded = image::load_from_memory(&png)
+            .expect("encoded PNG must decode")
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 1));
+        assert_eq!(decoded.into_raw(), pixels);
+    }
+
+    #[test]
+    fn zero_extent_encodes_nothing_and_writes_nothing() {
+        assert!(encode(0, 0, &[]).is_empty());
+        assert!(encode(0, 4, &[]).is_empty());
+        assert!(encode(4, 0, &[]).is_empty());
+        let path =
+            std::env::temp_dir().join(format!("dream_zero_extent_{}.png", std::process::id()));
+        // A stale file from an interrupted run must not fail the assertion
+        // that the rejected write creates nothing.
+        let _ = std::fs::remove_file(&path);
+        let err = write(&path, 0, 4, &[]).expect_err("zero width must not write");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!path.exists(), "no file is created for a rejected capture");
     }
 }
