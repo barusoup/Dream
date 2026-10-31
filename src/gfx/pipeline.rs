@@ -12,9 +12,6 @@ pub(super) fn scaled_size(size: (u32, u32), scale: f32) -> (u32, u32) {
     )
 }
 
-/// Vulkan's default NDC has y pointing down; a negative viewport height flips it
-/// back to the y-up, depth-0..1 convention every shader here is written against.
-
 /// The scene pass' viewport and scissor: the region of the render target the
 /// app's scene panel occupies, mapped from display pixels into render pixels.
 /// The viewport itself stays the full target; the scissor does the confining,
@@ -60,6 +57,8 @@ pub(super) fn scene_region(
     )
 }
 
+/// Vulkan's default NDC has y pointing down; a negative viewport height flips it
+/// back to the y-up, depth-0..1 convention every shader here is written against.
 pub(super) fn make_viewport(size: (u32, u32)) -> vk::Viewport {
     vk::Viewport {
         x: 0.0,
