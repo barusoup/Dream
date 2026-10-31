@@ -508,3 +508,31 @@ pub(super) fn build_targets(ctx: &Arc<GpuContext>, render_size: (u32, u32)) -> S
         depth,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Present reports the same conditions as acquire; the distinction is
+    /// what lets a caller rebuild the swapchain instead of treating a resize
+    /// as an undiagnosable failure.
+    #[test]
+    fn swapchain_results_keep_their_resize_signal() {
+        assert_eq!(
+            map_surface_error(vk::Result::ERROR_OUT_OF_DATE_KHR),
+            SurfaceError::Outdated
+        );
+        assert_eq!(
+            map_surface_error(vk::Result::ERROR_SURFACE_LOST_KHR),
+            SurfaceError::Lost
+        );
+        assert_eq!(
+            map_surface_error(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+            SurfaceError::OutOfMemory
+        );
+        assert_eq!(
+            map_surface_error(vk::Result::ERROR_UNKNOWN),
+            SurfaceError::Other
+        );
+    }
+}
