@@ -883,9 +883,10 @@ pub fn rasterize_svg_paths_with(
             .iter()
             .filter(|poly| {
                 poly.len() > 3
-                    && poly.first().zip(poly.last()).is_some_and(|(a, b)| {
-                        (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3
-                    })
+                    && poly
+                        .first()
+                        .zip(poly.last())
+                        .is_some_and(|(a, b)| (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3)
             })
             .collect()
     } else {
