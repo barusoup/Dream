@@ -1021,4 +1021,32 @@ impl Ui {
         };
         self.draw.atlas_region(quad, &self.cache, region, tint);
     }
+
+    /// Draw a custom SVG icon on its raw 24x24 grid: `rect` is where the grid
+    /// lands, with no ink fitting, so icons that share a grid line up and can
+    /// be layered. `bake` is the logical side the glyph is rasterized at, kept
+    /// apart from `rect` so a scale animation reuses one atlas entry. `stroke`
+    /// is the line weight on the grid (Lucide's is 2). With
+    /// `fill`, closed subpaths are filled as well as stroked.
+    pub fn grid_icon(
+        &mut self,
+        name: &str,
+        rect: Rect,
+        bake: f32,
+        svg_paths: &[&str],
+        fill: bool,
+        stroke: f32,
+        tint: Color,
+    ) {
+        let id = self.id(name);
+        let scale = self.scale;
+        let raster = (bake * scale).round().max(1.0) as u32;
+        let Some(region) =
+            self.icons
+                .custom_region_filled(id, svg_paths, raster, stroke, fill, &mut self.cache)
+        else {
+            return;
+        };
+        self.draw.atlas_region(rect, &self.cache, region, tint);
+    }
 }

@@ -849,11 +849,48 @@ impl Icon {
 /// grid into `size`x`size` 8-bit coverage with `stroke_width` (2.0 is
 /// Lucide's standard weight).
 pub fn rasterize_svg_paths(paths: &[&str], size: u32, stroke_width: f32) -> Vec<u8> {
+    rasterize_svg_paths_with(paths, size, stroke_width, false)
+}
+
+/// Whether `p` lies inside the closed polyline `poly` (even-odd).
+fn point_in_poly(poly: &[(f32, f32)], p: (f32, f32)) -> bool {
+    let mut inside = false;
+    for pair in poly.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if (a.1 > p.1) != (b.1 > p.1) && p.0 < (b.0 - a.0) * (p.1 - a.1) / (b.1 - a.1) + a.0 {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// Like [`rasterize_svg_paths`], and when `fill` is set the closed subpaths
+/// (those that end where they began) are filled as well as stroked, as an SVG
+/// with `fill="currentColor"` would be. Open subpaths stay stroke-only.
+pub fn rasterize_svg_paths_with(
+    paths: &[&str],
+    size: u32,
+    stroke_width: f32,
+    fill: bool,
+) -> Vec<u8> {
     let size = size.max(1);
     let mut polys = Vec::new();
     for &d in paths {
         flatten_path(d, &mut polys);
     }
+    let closed: Vec<&Vec<(f32, f32)>> = if fill {
+        polys
+            .iter()
+            .filter(|poly| {
+                poly.len() > 3
+                    && poly.first().zip(poly.last()).is_some_and(|(a, b)| {
+                        (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3
+                    })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let scale = size as f32 / GRID;
     let half_stroke = stroke_width.max(0.25) * 0.5;
     let pixel = 1.0 / scale;
@@ -867,6 +904,12 @@ pub fn rasterize_svg_paths(paths: &[&str], size: u32, stroke_width: f32) -> Vec<
         for x in 0..size {
             let center = ((x as f32 + 0.5) / scale, (y as f32 + 0.5) / scale);
             let d_center = stroke_distance(&polys, center);
+            // The stroke covers every edge of the fill, so a pixel is either
+            // wholly inside the shape or the stroke below antialiases it.
+            if closed.iter().any(|poly| point_in_poly(poly, center)) {
+                out[(y * size + x) as usize] = 255;
+                continue;
+            }
             if d_center >= half_stroke + band {
                 continue;
             }
@@ -982,6 +1025,29 @@ impl IconSet {
         None
     }
 
+    /// Like [`Self::custom_region`], optionally filling closed subpaths.
+    pub fn custom_region_filled(
+        &mut self,
+        id: u64,
+        paths: &[&str],
+        size: u32,
+        stroke_width: f32,
+        fill: bool,
+        cache: &mut GlyphCache,
+    ) -> Option<Region> {
+        let size = size.max(1);
+        let key = (id, size);
+        if let Some(region) = self.custom.get(&key) {
+            return Some(*region);
+        }
+        let coverage = rasterize_svg_paths_with(paths, size, stroke_width, fill);
+        if let Ok(region) = cache.insert_coverage(&coverage, size, size) {
+            self.custom.insert(key, region);
+            return Some(region);
+        }
+        None
+    }
+
     /// Baked (icon, size) pairs — atlas diagnostics.
     pub fn baked(&self) -> usize {
         self.regions.len() + self.custom.len()
@@ -998,6 +1064,18 @@ mod tests {
             page_size: 512,
             padding: 1,
         }))
+    }
+
+    #[test]
+    fn a_filled_closed_path_is_solid_inside_and_open_paths_stay_hollow() {
+        let square = ["M4 4H20V20H4Z"];
+        let hollow = rasterize_svg_paths_with(&square, 24, 2.0, false);
+        let solid = rasterize_svg_paths_with(&square, 24, 2.0, true);
+        assert_eq!(hollow[12 * 24 + 12], 0);
+        assert_eq!(solid[12 * 24 + 12], 255);
+        let open = ["M4 4H20V20H4"];
+        let still_open = rasterize_svg_paths_with(&open, 24, 2.0, true);
+        assert_eq!(still_open[12 * 24 + 12], 0);
     }
 
     #[test]
