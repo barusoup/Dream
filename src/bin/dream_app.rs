@@ -145,6 +145,16 @@ impl Studio {
     }
 }
 
+/// The Dream logo as the window icon (taskbar and task switcher). `None`
+/// if the embedded PNG fails to decode, which leaves the OS default in place.
+fn app_icon() -> Option<winit::window::Icon> {
+    let logo = image::load_from_memory(include_bytes!("../../assets/branding/dream_icon.png"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = logo.dimensions();
+    winit::window::Icon::from_rgba(logo.into_raw(), width, height).ok()
+}
+
 impl ApplicationHandler for Studio {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
@@ -152,6 +162,7 @@ impl ApplicationHandler for Studio {
                 .create_window(
                     Window::default_attributes()
                         .with_title("Dream Studio")
+                        .with_window_icon(app_icon())
                         // The app owns its chrome: no OS decorations.
                         .with_decorations(false)
                         // Logical units: on a HiDPI display this asks for a
