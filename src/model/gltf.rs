@@ -385,31 +385,205 @@ fn parse_uv_transform(value: &gltf::json::Value) -> Option<UvTransform> {
     })
 }
 
-fn rgba8_from_gltf(image: &gltf::image::Data) -> crate::texture::DecodedTexture {
+/// Channel count and bytes per sample of a decoded glTF image format.
+fn gltf_image_layout(format: gltf::image::Format) -> (usize, usize) {
     use gltf::image::Format;
+    match format {
+        Format::R8 => (1, 1),
+        Format::R8G8 => (2, 1),
+        Format::R8G8B8 => (3, 1),
+        Format::R8G8B8A8 => (4, 1),
+        Format::R16 => (1, 2),
+        Format::R16G16 => (2, 2),
+        Format::R16G16B16 => (3, 2),
+        Format::R16G16B16A16 => (4, 2),
+        Format::R32G32B32FLOAT => (3, 4),
+        Format::R32G32B32A32FLOAT => (4, 4),
+    }
+}
+
+/// Convert a decoded glTF image to RGBA8 in the layout the GPU upload
+/// expects (`width * height * 4` bytes). glTF images can arrive as 1-4
+/// channels at 8/16-bit integer or 32-bit float precision; normalizing every
+/// format here keeps a 16-bit or greyscale source texture from reaching the
+/// uploader with a byte count it would reject.
+///
+/// `gltf` decodes through `image::DynamicImage`: luminance+alpha images map
+/// to `R8G8`/`R16G16`, and 16-bit/float samples arrive as native-endian
+/// bytes because `into_bytes` reinterprets the decoded scalar buffer.
+fn rgba8_from_gltf(image: &gltf::image::Data) -> crate::texture::DecodedTexture {
     let (width, height) = (image.width, image.height);
-    let pixels = match image.format {
-        Format::R8G8B8A8 => image.pixels.clone(),
-        Format::R8G8B8 => image
-            .pixels
-            .chunks_exact(3)
-            .flat_map(|px| [px[0], px[1], px[2], 255])
-            .collect(),
-        Format::R8G8 => image
-            .pixels
-            .chunks_exact(2)
-            .flat_map(|px| [px[0], px[1], px[0], 255])
-            .collect(),
-        Format::R8 => image
-            .pixels
-            .iter()
-            .flat_map(|&px| [px, px, px, 255])
-            .collect(),
-        _ => image.pixels.clone(),
+    let texels = (width as usize) * (height as usize);
+    let (channels, sample_bytes) = gltf_image_layout(image.format);
+    let source_len = texels
+        .checked_mul(channels)
+        .and_then(|len| len.checked_mul(sample_bytes));
+    let Some(source_len) = source_len else {
+        return opaque_black(width, height);
     };
+    if image.pixels.len() < source_len {
+        // Truncated source: an opaque-black image of the right size beats
+        // handing the uploader a mismatched buffer.
+        return opaque_black(width, height);
+    }
+    // RGBA8 is already the destination layout: one copy, no per-texel work.
+    // Trailing bytes beyond the declared texels are dropped, because the
+    // uploader requires exactly `width * height * 4`.
+    if channels == 4 && sample_bytes == 1 {
+        return crate::texture::DecodedTexture {
+            pixels: image.pixels[..texels * 4].to_vec(),
+            width,
+            height,
+        };
+    }
+    // One channel as 8-bit: whole bytes pass through, 16-bit samples use
+    // their high byte, floats are clamped into 0..1.
+    let sample = |index: usize| -> u8 {
+        match sample_bytes {
+            1 => image.pixels[index],
+            2 => {
+                let sample =
+                    u16::from_ne_bytes([image.pixels[index * 2], image.pixels[index * 2 + 1]]);
+                (sample >> 8) as u8
+            }
+            _ => {
+                let at = index * 4;
+                let value = f32::from_ne_bytes([
+                    image.pixels[at],
+                    image.pixels[at + 1],
+                    image.pixels[at + 2],
+                    image.pixels[at + 3],
+                ]);
+                (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+            }
+        }
+    };
+    let mut pixels = Vec::with_capacity(texels.saturating_mul(4));
+    for texel in 0..texels {
+        let base = texel * channels;
+        let (r, g, b, a) = match channels {
+            1 => {
+                let v = sample(base);
+                (v, v, v, 255)
+            }
+            // Luminance + alpha: replicate the luminance, keep the alpha.
+            2 => {
+                let v = sample(base);
+                (v, v, v, sample(base + 1))
+            }
+            3 => (sample(base), sample(base + 1), sample(base + 2), 255),
+            _ => (
+                sample(base),
+                sample(base + 1),
+                sample(base + 2),
+                sample(base + 3),
+            ),
+        };
+        pixels.extend_from_slice(&[r, g, b, a]);
+    }
     crate::texture::DecodedTexture {
         pixels,
         width,
         height,
+    }
+}
+
+/// An opaque-black RGBA8 image of `width` x `height`.
+fn opaque_black(width: u32, height: u32) -> crate::texture::DecodedTexture {
+    let len = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    let mut pixels = vec![0u8; len];
+    for texel in pixels.chunks_exact_mut(4) {
+        texel[3] = 255;
+    }
+    crate::texture::DecodedTexture {
+        pixels,
+        width,
+        height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(pixels: Vec<u8>, format: gltf::image::Format) -> gltf::image::Data {
+        gltf::image::Data {
+            pixels,
+            format,
+            width: 1,
+            height: 1,
+        }
+    }
+
+    #[test]
+    fn gltf_16_bit_images_normalize_to_rgba8() {
+        let mut pixels = Vec::new();
+        for value in [0xFF00u16, 0x8000, 0x0100, 0xFFFF] {
+            pixels.extend_from_slice(&value.to_ne_bytes());
+        }
+        let out = rgba8_from_gltf(&image(pixels, gltf::image::Format::R16G16B16A16));
+        assert_eq!(out.pixels, vec![0xFF, 0x80, 0x01, 0xFF]);
+        assert_eq!((out.width, out.height), (1, 1));
+    }
+
+    #[test]
+    fn gltf_greyscale_and_float_images_fill_rgba() {
+        let out = rgba8_from_gltf(&image(vec![0x40], gltf::image::Format::R8));
+        assert_eq!(out.pixels, vec![0x40, 0x40, 0x40, 0xFF]);
+        let mut pixels = Vec::new();
+        for value in [0.0f32, 0.5, 2.0] {
+            pixels.extend_from_slice(&value.to_ne_bytes());
+        }
+        let out = rgba8_from_gltf(&image(pixels, gltf::image::Format::R32G32B32FLOAT));
+        assert_eq!(out.pixels, vec![0, 128, 255, 255]);
+    }
+
+    #[test]
+    fn gltf_luminance_alpha_images_keep_their_alpha() {
+        let out = rgba8_from_gltf(&image(vec![0x80, 0x20], gltf::image::Format::R8G8));
+        assert_eq!(out.pixels, vec![0x80, 0x80, 0x80, 0x20]);
+        let mut pixels = Vec::new();
+        for value in [0xFF00u16, 0x4000] {
+            pixels.extend_from_slice(&value.to_ne_bytes());
+        }
+        let out = rgba8_from_gltf(&image(pixels, gltf::image::Format::R16G16));
+        assert_eq!(out.pixels, vec![0xFF, 0xFF, 0xFF, 0x40]);
+    }
+
+    #[test]
+    fn gltf_rgb_images_gain_an_opaque_alpha() {
+        let out = rgba8_from_gltf(&image(vec![10, 20, 30], gltf::image::Format::R8G8B8));
+        assert_eq!(out.pixels, vec![10, 20, 30, 0xFF]);
+    }
+
+    #[test]
+    fn gltf_rgba8_passes_through_exactly_and_drops_trailing_bytes() {
+        let out = rgba8_from_gltf(&image(
+            vec![1, 2, 3, 4, 9, 9],
+            gltf::image::Format::R8G8B8A8,
+        ));
+        assert_eq!(out.pixels, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn gltf_truncated_pixels_still_yield_exact_rgba8() {
+        let source = gltf::image::Data {
+            pixels: vec![1, 2],
+            format: gltf::image::Format::R8G8B8A8,
+            width: 4,
+            height: 4,
+        };
+        let out = rgba8_from_gltf(&source);
+        assert_eq!(out.pixels.len(), 4 * 4 * 4);
+        assert!(
+            out.pixels
+                .iter()
+                .skip(3)
+                .step_by(4)
+                .all(|&alpha| alpha == 255),
+            "every texel stays opaque"
+        );
     }
 }
