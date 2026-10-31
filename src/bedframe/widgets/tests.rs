@@ -4078,6 +4078,10 @@ fn key_feed_latches_and_chord_misses() {
     assert!(feed.chord(&mut input, 'x'));
     assert!(input.nav.cut);
     assert!(!feed.chord(&mut input, 'b'));
+    // The shortcut modifier is Super on macOS, where Control only latches
+    // the word key.
+    #[cfg(target_os = "macos")]
+    feed.key(&mut input, Key::Super, true);
     feed.key(&mut input, Key::Char('q'), true);
     assert!(input.text.is_empty(), "a command-chord never types");
     // Plain chars type; control chars drop.
