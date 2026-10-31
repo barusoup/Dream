@@ -102,7 +102,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             pkg-config libasound2-dev libwayland-dev libxkbcommon-dev \
-            xvfb mesa-vulkan-drivers vulkan-tools
+            libxkbcommon-x11-0 xvfb mesa-vulkan-drivers vulkan-tools
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Pick the software implementation explicitly: the runner has no GPU,
