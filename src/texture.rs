@@ -31,6 +31,7 @@ mod decode;
 mod gpu;
 mod manager;
 mod sampler;
+mod upload;
 
 pub use decode::{DecodedTexture, decode_rgba8, mip_levels_for};
 pub use gpu::{
@@ -39,6 +40,7 @@ pub use gpu::{
 };
 pub use manager::{TextureId, TextureManager, TextureStats};
 pub use sampler::{AddressMode, Filter, MipFilter, SamplerDesc, create_sampler};
+pub use upload::TextureUploader;
 
 use ash::vk;
 

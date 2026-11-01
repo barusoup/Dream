@@ -61,8 +61,8 @@ pub fn create_sampled_texture_set_layout(ctx: &GpuContext) -> vk::DescriptorSetL
 /// A GPU texture with its sampler and descriptor set. See the module docs for
 /// the lifetime and layout contract.
 pub struct GpuTexture {
-    ctx: Arc<GpuContext>,
-    image: GpuImage,
+    pub(super) ctx: Arc<GpuContext>,
+    pub(super) image: GpuImage,
     sampler: vk::Sampler,
     layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
@@ -71,13 +71,13 @@ pub struct GpuTexture {
     /// [`SAMPLED_TEXTURE_SET_BINDINGS`].
     sampled_layout: vk::DescriptorSetLayout,
     sampled_set: vk::DescriptorSet,
-    width: u32,
-    height: u32,
-    mip_levels: u32,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) mip_levels: u32,
     format: TextureFormat,
     /// The actual Vulkan format (e.g. R8 for coverage pages) — `format`
     /// is only the publicly reported bucket.
-    vk_format: vk::Format,
+    pub(super) vk_format: vk::Format,
 }
 
 impl GpuTexture {

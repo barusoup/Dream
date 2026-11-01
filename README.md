@@ -21,7 +21,7 @@ cargo run --release --bin dream_study            # headless integration check
 cargo test --all-targets
 ```
 
-Contributor conventions: [`AGENTS.md`](AGENTS.md). BedFrame guide: [`docs/bedframe-cookbook.md`](docs/bedframe-cookbook.md).
+Contributor conventions: [`AGENTS.md`](AGENTS.md). BedFrame guide: [`docs/bedframe-cookbook.md`](docs/bedframe-cookbook.md). Runtime media (FFmpeg stills, video and audio) lives in the separate [`dream-media`](https://github.com/barusoup/dream-media) crate; Dream does not depend on it.
 
 ## License
 
