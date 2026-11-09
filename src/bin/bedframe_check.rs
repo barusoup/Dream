@@ -72,6 +72,9 @@ enum Extra {
     Gallery(bool),
     /// Same gallery with devtools outlines on — sanity assert only.
     GalleryDevtools,
+    /// White discs on black at fractional centres, checked pixel by pixel
+    /// against the analytic anti-aliasing coverage (see `check_circle_edges`).
+    CircleEdges,
     UiOnlyBeforeScene,
     UiOnlyAfterScene,
 }
@@ -114,6 +117,20 @@ const STEPS: &[Step] = &[
         resize_to: None,
         text: "BedFrame OK",
         extra: Some(Extra::Primitives),
+    },
+    Step {
+        name: "circles",
+        scale: 1.0,
+        resize_to: None,
+        text: "BedFrame OK",
+        extra: Some(Extra::CircleEdges),
+    },
+    Step {
+        name: "circles-1.25",
+        scale: 1.25,
+        resize_to: None,
+        text: "BedFrame OK",
+        extra: Some(Extra::CircleEdges),
     },
     Step {
         name: "new-glyphs",
@@ -700,6 +717,135 @@ fn build_gallery_frame(ui: &mut Ui, scale: f32, light: bool) -> UiFrame {
     ui.end()
 }
 
+/// Discs `(x, y, radius)` in logical points for the circle-edge check. The
+/// fractional centres put each extreme at a different place against the pixel
+/// grid, which is where a bounding quad without the anti-aliasing pad clips
+/// the outer half of the edge band.
+const CIRCLE_PROBES: &[(f32, f32, f32)] = &[
+    (40.0, 40.0, 6.0),
+    (80.3, 40.3, 6.0),
+    (120.5, 40.5, 6.0),
+    (160.7, 40.2, 6.0),
+    (40.0, 120.0, 15.0),
+    (80.3, 120.3, 15.0),
+    (120.5, 120.5, 15.0),
+    (160.7, 120.2, 15.0),
+];
+
+/// Largest allowed difference between a pixel's measured coverage and the
+/// analytic coverage: 5/255, the rounding of an 8-bit target plus slack.
+const CIRCLE_COVERAGE_TOL: f32 = 0.02;
+
+/// Largest allowed relative error of a disc's total ink against `pi r^2`.
+const CIRCLE_INK_TOL: f32 = 0.03;
+
+/// White discs on black, drawn through the public `DrawList` path.
+fn build_circle_frame(ui: &mut Ui, scale: f32, screen: (f32, f32)) -> UiFrame {
+    ui.set_scale(scale);
+    ui.begin(UiInput::default(), screen);
+    let (width, height) = screen;
+    ui.draw_list_mut()
+        .round_rect(Rect::new(0.0, 0.0, width, height), 0.0, Color::BLACK);
+    for &(cx, cy, r) in CIRCLE_PROBES {
+        ui.draw_list_mut().fill_circle((cx, cy), r, Color::WHITE);
+    }
+    ui.end()
+}
+
+/// The coverage the shader computes for a disc at pixel `(x, y)`:
+/// `clamp(0.5 - d, 0, 1)`, with `d` the distance from the pixel centre to the
+/// edge, in physical pixels (`ui.wgsl`, the SDF modes).
+fn disc_coverage(x: u32, y: u32, centre: (f32, f32), radius: f32) -> f32 {
+    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+    let d = (px - centre.0).hypot(py - centre.1) - radius;
+    (0.5 - d).clamp(0.0, 1.0)
+}
+
+/// Check the discs drawn by [`build_circle_frame`] at UI scale `scale`.
+///
+/// Every pixel on the horizontal line through the centre row and the vertical
+/// line through the centre column must match the analytic coverage within
+/// [`CIRCLE_COVERAGE_TOL`]. That includes the four extremes, which are also
+/// reported on their own. The disc's total ink, the sum of coverage over its
+/// bounding box, must match `pi r^2` within [`CIRCLE_INK_TOL`]. Panics on the
+/// first mismatch.
+fn check_circle_edges(pixels: &[u8], width: u32, height: u32, scale: f32, name: &str) {
+    for &(cx, cy, r) in CIRCLE_PROBES {
+        let centre = (cx * scale, cy * scale);
+        let radius = r * scale;
+        let x_lo = ((centre.0 - radius).floor() as i64 - 2).max(0);
+        let x_hi = ((centre.0 + radius).ceil() as i64 + 2).min(i64::from(width) - 1);
+        let y_lo = ((centre.1 - radius).floor() as i64 - 2).max(0);
+        let y_hi = ((centre.1 + radius).ceil() as i64 + 2).min(i64::from(height) - 1);
+        // (analytic, measured) for one pixel; greys only, since the disc is
+        // white on black and the blend is gamma (encoded values averaged).
+        let sample = |x: u32, y: u32| -> (f32, f32) {
+            let px = rgba_at(pixels, width, x as f32, y as f32);
+            assert!(
+                px[0] == px[1] && px[1] == px[2],
+                "[{name}] disc ({cx},{cy}) r={r} pixel ({x},{y}) is not grey: {px:?}"
+            );
+            let measured = f32::from(px[0]) / 255.0;
+            (disc_coverage(x, y, centre, radius), measured)
+        };
+        let row = centre.1.floor() as u32;
+        let col = centre.0.floor() as u32;
+        let horizontal: Vec<(f32, f32)> = (x_lo..=x_hi).map(|x| sample(x as u32, row)).collect();
+        let vertical: Vec<(f32, f32)> = (y_lo..=y_hi).map(|y| sample(col, y as u32)).collect();
+
+        let mut worst = 0.0f32;
+        for (axis, line) in [("horizontal", &horizontal), ("vertical", &vertical)] {
+            for (i, &(analytic, measured)) in line.iter().enumerate() {
+                let err = (measured - analytic).abs();
+                worst = worst.max(err);
+                assert!(
+                    err <= CIRCLE_COVERAGE_TOL,
+                    "[{name}] disc ({cx},{cy}) r={r} {axis} sample {i}: measured {measured:.4}, analytic {analytic:.4}"
+                );
+            }
+        }
+        // The first and last sample with any analytic coverage are the four
+        // extremes, one per side.
+        let extreme = |line: &[(f32, f32)], last: bool| -> (f32, f32) {
+            let mut hits = line.iter().filter(|s| s.0 > 0.0);
+            let hit = if last { hits.next_back() } else { hits.next() };
+            *hit.expect("disc has coverage on this line")
+        };
+        let (left, right) = (extreme(&horizontal, false), extreme(&horizontal, true));
+        let (top, bottom) = (extreme(&vertical, false), extreme(&vertical, true));
+
+        let (mut ink, mut ink_analytic) = (0.0f32, 0.0f32);
+        for y in y_lo..=y_hi {
+            for x in x_lo..=x_hi {
+                let px = rgba_at(pixels, width, x as f32, y as f32);
+                ink += f32::from(px[0]) / 255.0;
+                ink_analytic += disc_coverage(x as u32, y as u32, centre, radius);
+            }
+        }
+        let expected = std::f32::consts::PI * radius * radius;
+        let ink_err = (ink - expected).abs() / expected;
+        assert!(
+            ink_err <= CIRCLE_INK_TOL,
+            "[{name}] disc ({cx},{cy}) r={r} ink {ink:.2} vs pi r^2 {expected:.2} ({:.2}% off)",
+            ink_err * 100.0
+        );
+        println!(
+            "[circle-edges] {name} disc ({cx},{cy}) r={r} R={radius:.3}px: max|err|={worst:.4}; \
+             extremes L/R/T/B measured {:.3}/{:.3}/{:.3}/{:.3} analytic {:.3}/{:.3}/{:.3}/{:.3}; \
+             ink {ink:.2} (analytic {ink_analytic:.2}) vs pi R^2 {expected:.2}, err {:.2}%",
+            left.1,
+            right.1,
+            top.1,
+            bottom.1,
+            left.0,
+            right.0,
+            top.0,
+            bottom.0,
+            ink_err * 100.0
+        );
+    }
+}
+
 /// One pixel from the captured frame (top-left origin).
 fn rgba_at(pixels: &[u8], width: u32, x: f32, y: f32) -> [u8; 4] {
     let x = (x.max(0.0) as u32).min(width - 1);
@@ -1146,6 +1292,18 @@ impl Check {
                 ui.recycle_frame(frame);
                 blocking_before = renderer.context().blocking_submissions();
             }
+            Some(Extra::CircleEdges) => {
+                blocking_before = renderer.context().blocking_submissions();
+                let frame = build_circle_frame(ui, step.scale, logical);
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render circle frame",
+                    |_| 0,
+                    &frame,
+                );
+                ui.recycle_frame(frame);
+            }
             Some(Extra::Primitives) => {
                 // The standard scene already carries the paint primitives
                 // (see `build_frame`); this step only changes which pixels
@@ -1242,7 +1400,10 @@ impl Check {
         // the gallery have no standard scene — only dedicated asserts.
         let standard = !matches!(
             step.extra,
-            Some(Extra::LegacyUpload) | Some(Extra::Gallery(_)) | Some(Extra::GalleryDevtools)
+            Some(Extra::LegacyUpload)
+                | Some(Extra::Gallery(_))
+                | Some(Extra::GalleryDevtools)
+                | Some(Extra::CircleEdges)
         );
         let theme = Theme::dark_theme();
         let panel_style = PanelStyle::default();
@@ -1396,26 +1557,12 @@ impl Check {
             );
             // Half-alpha tint: centre of the tinted crop blends magenta over
             // the background at ~50% — not full magenta, not transparent.
+            // The default UI blend is `UiBlend::Gamma`: sRGB-encoded values
+            // are averaged directly, as browsers do, so the expected red is
+            // (255 + bg) / 2. (Linear-light blending would give ~188 here.)
             let tinted = rgba_at(&pixels, width, 184.0 * s, 127.0 * s);
             let blend = |a: u8, b: u8| -> bool { a.abs_diff(b) <= 24 };
-            let to_lin = |v: u8| {
-                let c = v as f32 / 255.0;
-                if c <= 0.04045 {
-                    c / 12.92
-                } else {
-                    ((c + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            let from_lin = |v: f32| {
-                let c = v.clamp(0.0, 1.0);
-                let encoded = if c <= 0.0031308 {
-                    12.92 * c
-                } else {
-                    1.055 * c.powf(1.0 / 2.4) - 0.055
-                };
-                (encoded * 255.0).round() as u8
-            };
-            let expected_r = from_lin(0.5 * to_lin(255) + 0.5 * to_lin(outside_bg[0]));
+            let expected_r = ((255.0 + outside_bg[0] as f32) * 0.5).round() as u8;
             assert!(
                 blend(tinted[0], expected_r),
                 "[{}] tinted crop ~half magenta, got {tinted:?} bg {outside_bg:?}",
@@ -1423,6 +1570,7 @@ impl Check {
             );
         }
         match step.extra {
+            Some(Extra::CircleEdges) => check_circle_edges(&pixels, width, height, s, step.name),
             Some(Extra::Primitives) => {
                 // Pixel probes over the paint primitives. Background is
                 // the clear colour sampled from an empty corner.
@@ -1943,11 +2091,13 @@ impl ApplicationHandler for Check {
             upscale: UpscalePreset::Native,
             sharpness: 0.6,
         };
-        let renderer = Renderer::new(
+        let mut renderer = Renderer::new(
             Arc::clone(&window),
             include_str!("../app/scene.wgsl"),
             settings,
         );
+        // Every check reads frames back, so keep the composed frame.
+        renderer.set_frame_capture(true);
         let ctx = Arc::clone(renderer.context());
         // Solid magenta 8x8: unmistakable texel to assert on.
         let fonts = Fonts::bundled();

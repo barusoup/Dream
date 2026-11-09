@@ -480,6 +480,9 @@ impl ApplicationHandler for Run {
             },
         );
 
+        // The study reads composed frames back (`capture_rgba8`, `save_png`).
+        renderer.set_frame_capture(true);
+
         // --- Scene geometry ----------------------------------------------
         let (vertices, indices) = scene_geometry();
         let vertex_buffer = renderer

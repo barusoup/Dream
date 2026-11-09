@@ -359,7 +359,7 @@ fn run(event_loop: &ActiveEventLoop, dir: &Path, load_only: bool) -> bool {
             )
             .expect("window"),
     );
-    let renderer = Renderer::new(
+    let mut renderer = Renderer::new(
         window,
         SCENE,
         Settings {
@@ -368,6 +368,8 @@ fn run(event_loop: &ActiveEventLoop, dir: &Path, load_only: bool) -> bool {
             sharpness: 0.6,
         },
     );
+    // The qualification reads back composed frames (`capture_rgba8`).
+    renderer.set_frame_capture(true);
     assert_eq!(renderer.render_size(), (W, H), "qualification resolution");
     let ctx = renderer.context().clone();
     let lighting = Lighting::new(&ctx);

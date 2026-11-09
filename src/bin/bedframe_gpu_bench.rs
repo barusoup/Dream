@@ -123,6 +123,10 @@ impl ApplicationHandler for Probe {
             frame.indices.len(),
             frame.cmds.len()
         );
+        // The pixel checks read composed frames back; the timing loops below
+        // run with capture off, the default direct path.
+        renderer.set_frame_capture(true);
+        render(&mut renderer, &frame, false);
         let (ui_pixels, w, h) = renderer.capture_rgba8();
         render(&mut renderer, &frame, true);
         let (scene_pixels, sw, sh) = renderer.capture_rgba8();
@@ -176,6 +180,7 @@ impl ApplicationHandler for Probe {
             "scene_rebuilt,live_allocator_bytes={},pixel_max_difference_lsb={rebuilt_worst}",
             rebuilt.0
         );
+        renderer.set_frame_capture(false);
         profile(&mut renderer, &frame, true, "scene_under_opaque_ui");
         profile(&mut renderer, &frame, false, "ui_only_after_scene");
         profile(&mut renderer, &frame, true, "scene_under_opaque_ui_repeat");

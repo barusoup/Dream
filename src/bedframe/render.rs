@@ -61,6 +61,12 @@ impl ResizePolicy {
         self.capacity
     }
 
+    /// Back to the creation size, with the shrink count restarted.
+    fn reset_to_floor(&mut self) {
+        self.capacity = self.floor;
+        self.low_frames = 0;
+    }
+
     /// Account for a frame needing `needed` bytes and return the new capacity
     /// when the buffer must be recreated, or `None` to keep the existing one.
     fn resolve(&mut self, needed: u64) -> Option<u64> {
@@ -173,21 +179,24 @@ pub struct UiRenderer {
 /// Colour space the UI pass blends in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UiBlend {
-    /// Linear light: colours are decoded to linear and the sRGB target
-    /// encodes on write. Physically correct; the engine default.
-    #[default]
-    Linear,
     /// sRGB-encoded values, the way web browsers composite: translucent
     /// layers, gradients and anti-aliased edges match CSS pixel for pixel.
-    /// Needs a UNORM target holding encoded values.
+    /// Needs a UNORM target holding encoded values. The engine default.
+    #[default]
     Gamma,
+    /// Physically linear light: colours are decoded to linear and the sRGB
+    /// target encodes on write. Light-on-dark edges look heavier and dark
+    /// text on light backgrounds thinner than in browsers. Opt in with
+    /// [`Renderer::new_with_ui_blend`](crate::gfx::Renderer::new_with_ui_blend).
+    Linear,
 }
 
 impl UiRenderer {
-    /// Build for targets of `format` (the swapchain format). The UI pass
-    /// writes straight-alpha sRGB colour; `format` should be an sRGB surface.
+    /// Build for targets of `format` (the swapchain format), blending in
+    /// [`UiBlend::default()`]. With the default [`UiBlend::Gamma`], `format`
+    /// must be a UNORM target that stores sRGB-encoded values.
     pub fn new(ctx: &Arc<GpuContext>, format: vk::Format, page_size: u32) -> Self {
-        Self::new_with_blend(ctx, format, page_size, UiBlend::Linear)
+        Self::new_with_blend(ctx, format, page_size, UiBlend::default())
     }
 
     /// Like [`Self::new`], with an explicit [`UiBlend`]. For
@@ -365,8 +374,38 @@ impl UiRenderer {
             .sum()
     }
 
+    /// Give every frame slot's upload buffers back at their policy floor, so
+    /// the peak of a busy spell is released at once instead of after a run of
+    /// quiet frames. An idle UI (hidden
+    /// window, minimised) calls this so it holds only its start-up footprint.
+    ///
+    /// The caller guarantees the GPU is idle (`device_wait_idle`): the old
+    /// buffers are freed here. Atlas pages and retained textures are not
+    /// touched.
+    pub fn trim(&mut self) {
+        for slot in &mut self.slots {
+            slot.vertex_policy.reset_to_floor();
+            slot.index_policy.reset_to_floor();
+            slot.instances_policy.reset_to_floor();
+            slot.staging_policy.reset_to_floor();
+            slot.vertices = self
+                .ctx
+                .create_host_vertex_buffer("ui vertices", slot.vertex_policy.capacity());
+            slot.indices = self
+                .ctx
+                .create_host_index_buffer("ui indices", slot.index_policy.capacity());
+            slot.instances = self
+                .ctx
+                .create_host_vertex_buffer("ui instances", slot.instances_policy.capacity());
+            slot.staging = self
+                .ctx
+                .create_transfer_buffer("ui atlas staging", slot.staging_policy.capacity());
+        }
+    }
+
     /// Record the UI pass onto `target_view` (`extent` in pixels). The target
-    /// must already hold the frame underneath (load, don't clear).
+    /// must already hold the frame underneath (load, don't clear). The target
+    /// is expected in `GENERAL`; see [`Self::record_in_layout`].
     pub fn record(
         &mut self,
         cmd: vk::CommandBuffer,
@@ -374,6 +413,29 @@ impl UiRenderer {
         target_view: vk::ImageView,
         extent: (u32, u32),
         frame: &UiFrame,
+    ) {
+        self.record_in_layout(
+            cmd,
+            frame_slot,
+            target_view,
+            extent,
+            frame,
+            vk::ImageLayout::GENERAL,
+        );
+    }
+
+    /// [`Self::record`] for a target held in `layout` (for example the
+    /// swapchain image, `COLOR_ATTACHMENT_OPTIMAL`, when the frame is composed
+    /// straight into it). The layout only changes the attachment's declared
+    /// layout; the pipelines and their blending are the same.
+    pub fn record_in_layout(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        frame_slot: usize,
+        target_view: vk::ImageView,
+        extent: (u32, u32),
+        frame: &UiFrame,
+        layout: vk::ImageLayout,
     ) {
         let device = self.ctx.device().clone();
         // The *last-record* counters reset every call — an empty-upload
@@ -494,7 +556,7 @@ impl UiRenderer {
                     .layer_count(1)
                     .color_attachments(&[vk::RenderingAttachmentInfo::default()
                         .image_view(target_view)
-                        .image_layout(vk::ImageLayout::GENERAL)
+                        .image_layout(layout)
                         .load_op(vk::AttachmentLoadOp::LOAD)
                         .store_op(vk::AttachmentStoreOp::STORE)]),
             );

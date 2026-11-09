@@ -15,6 +15,7 @@ A Rust game engine that doubles as an app framework. It includes BedFrame, a UI 
 ## Run
 
 ```
+cargo run --release --example hello              # minimal app (examples/hello.rs)
 cargo run --release --bin dream_app              # editor app
 cargo run --release --bin dream_app -- --selfcheck
 cargo run --release --bin dream_study            # headless integration check

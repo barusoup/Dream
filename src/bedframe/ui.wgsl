@@ -36,8 +36,9 @@ struct Vs_out {
     @location(3) @interpolate(flat) quad_origin_bits: vec2<u32>,
     // This fragment's pixel-space position (interpolated).
     @location(4) pix: vec2<f32>,
-    // Extra shape data (the rounded clip's half extent for mode -1;
-    // zero otherwise). Uniform per quad.
+    // Extra shape data: the rounded clip's half extent for mode -1; the
+    // anti-aliasing pad from the padded quad origin to the shape for modes
+    // 2 and -2; zero otherwise. Uniform per quad.
     @location(5) extra: vec2<f32>,
 }
 
@@ -272,11 +273,13 @@ fn coverage(in: Vs_out, alpha: f32) -> f32 {
             // Rounded texture: params.xy carry the FULL pixel size, uv
             // stays a pure sample coordinate (a crop may span any subrect).
             // The SDF position is recovered from the flat quad origin —
-            // V0 top-left under the provoking-vertex assumption.
+            // V0 top-left under the provoking-vertex assumption. That origin
+            // is the padded quad's corner, so `extra` (the pad) steps back to
+            // the shape's own origin.
             let origin = vec2<f32>(
                 bitcast<f32>(in.quad_origin_bits.x),
                 bitcast<f32>(in.quad_origin_bits.y),
-            );
+            ) + in.extra;
             // params.xy is the FULL rect size; p is relative to the
             // rect's centre, so subtract the half-size.
             p = in.pix - origin - half * 0.5;
@@ -310,7 +313,7 @@ fn radial_t(in: Vs_out) -> f32 {
     let origin = vec2<f32>(
         bitcast<f32>(in.quad_origin_bits.x),
         bitcast<f32>(in.quad_origin_bits.y),
-    );
+    ) + in.extra;
     let half = in.params.xy * 0.5;
     let lenp = length(in.pix - origin - half);
     let outer = max(min(in.params.z, min(half.x, half.y)), 1e-4);
@@ -323,7 +326,7 @@ fn radial_edge(in: Vs_out) -> f32 {
     let origin = vec2<f32>(
         bitcast<f32>(in.quad_origin_bits.x),
         bitcast<f32>(in.quad_origin_bits.y),
-    );
+    ) + in.extra;
     let half = in.params.xy * 0.5;
     let lenp = length(in.pix - origin - half);
     let outer = max(min(in.params.z, min(half.x, half.y)), 1e-4);

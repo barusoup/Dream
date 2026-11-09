@@ -322,6 +322,13 @@ pub struct App {
     pub frames_skipped: u64,
     pub frames_immediate: u64,
     pub captures: u32,
+    /// Screenshots to write from the next presented frame: `capture_png`
+    /// turns frame capture on, and `render` saves them and restores the
+    /// capture state they found (`capture_restore`).
+    pending_captures: Vec<std::path::PathBuf>,
+    /// Frame-capture state before the first queued screenshot; `None` while
+    /// none is queued.
+    capture_restore: Option<bool>,
     /// Set while the user drags the viewport (camera controls).
     pub drag: Option<ViewportDrag>,
     /// Orbit state before the current viewport drag (undo snapshot).
@@ -404,6 +411,8 @@ impl App {
     pub fn selfcheck(&mut self) {
         let dir = std::path::Path::new("target/dream-app");
         std::fs::create_dir_all(dir).expect("create selfcheck dir");
+        // The run reads composed frames back, so keep them.
+        self.renderer.set_frame_capture(true);
         let states: [(SelfCheckShot, &str); 7] = [
             (SelfCheckShot::Default, "default"),
             (SelfCheckShot::Dark, "dark"),

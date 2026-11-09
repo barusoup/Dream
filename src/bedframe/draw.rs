@@ -38,8 +38,11 @@ pub struct UiVertex {
     /// `2` rounded texture, `3 + thickness` ring).
     pub params: [f32; 4],
     /// Extra shape data. Mode `-1` carries the rounded clip's half extent
-    /// (`[half_w, half_h]`); every other mode leaves it zero. Kept as a
-    /// separate attribute so the four historic channels stay compatible.
+    /// (`[half_w, half_h]`). Modes `2` and `-2` carry the anti-aliasing pad
+    /// `[pad, pad]`: their quad is grown by it, so the shader steps back
+    /// from the quad origin to the shape's own origin. Every other mode
+    /// leaves it zero. Kept as a separate attribute so the four historic
+    /// channels stay compatible.
     pub extra: [f32; 2],
 }
 
@@ -289,6 +292,14 @@ impl DrawList {
         self.scale
     }
 
+    /// Outward grow of an SDF quad, in logical units: one physical pixel.
+    /// The shaders put a 1px anti-aliasing band centred on each shape edge,
+    /// so the outer half of that band lies outside the shape's own rect and
+    /// would never be rasterized unless the quad grows by this much.
+    fn aa_pad(&self) -> f32 {
+        1.0 / self.scale
+    }
+
     /// Capture the cursor plus mutable tail state (tail cmd index count,
     /// scissor depth, layer) so `restore` rolls back cleanly.
     pub(crate) fn checkpoint(&self) -> Checkpoint {
@@ -344,6 +355,9 @@ impl DrawList {
                 v.params[0] += offset.0;
                 v.params[1] += offset.1;
             }
+            // Modes 2 and -2 need no extra work: their shape origin is the
+            // quad origin, which moved with `pos`, and `extra` is a relative
+            // pad.
             self.vertices.push(v);
         }
         let index_base = self.indices.len() as u32;
@@ -406,10 +420,12 @@ impl DrawList {
     /// still applies (so the square bound is hard), and the fragment stage
     /// additionally carves the corners for every plain-textured quad drawn
     /// under the scope: solid fills, glyphs, icons and images all follow
-    /// the rounding. The SDF shape primitives (`round_rect` and friends)
-    /// keep their own geometry and are clipped by the square bound only —
-    /// give such a shape the clip's radius as its own and it agrees with
-    /// the rounding by construction.
+    /// the rounding. A square [`Self::round_rect`] (radius 0) is drawn as a
+    /// plain quad under this scope and is carved too. The rounded SDF shape
+    /// primitives (`round_rect` with a radius, `round_ring`, `ring_arc`,
+    /// rounded images and shadows) keep their own geometry and are clipped
+    /// by the square bound only — give such a shape the clip's radius as its
+    /// own and it agrees with the rounding by construction.
     pub fn push_clip_rounded(&mut self, rect: Rect, radius: f32) {
         let rect = match self.scissor_stack.last() {
             Some(prev) => prev.rect().intersect(rect).unwrap_or(Rect::default()),
@@ -539,7 +555,18 @@ impl DrawList {
     /// shader from a signed distance, so corners stay crisp at any size and
     /// the whole shape is still a single quad (one draw call, no corner
     /// geometry).
+    ///
+    /// A square shape (`radius <= 0`) under a rounded clip is emitted as a
+    /// plain quad instead, so the clip's corner carve applies to it; a
+    /// rounded square needs no such path because its radius is the clip's
+    /// own.
     pub fn round_rect(&mut self, rect: Rect, radius: f32, color: Color) {
+        if radius <= 0.0 && matches!(self.scissor_stack.last(), Some(Clip::Rounded { .. })) {
+            if rect.w > 0.0 && rect.h > 0.0 {
+                self.quad(rect, None, color, CmdTexture::White);
+            }
+            return;
+        }
         self.push_round(rect, radius, color, 1.0);
     }
 
@@ -553,39 +580,44 @@ impl DrawList {
     /// Shared quad emit for filled rounded shapes (`mode` 1) and rings
     /// (`mode` 3 + thickness); see `ui.wgsl`.
     fn push_round(&mut self, rect: Rect, radius: f32, color: Color, mode: f32) {
-        if color.a == 0 || rect.w <= 0.0 || rect.h <= 0.0 || self.culled(rect) {
+        let pad = self.aa_pad();
+        let quad = rect.expand(pad);
+        if color.a == 0 || rect.w <= 0.0 || rect.h <= 0.0 || self.culled(quad) {
             return;
         }
         let (hw, hh) = (rect.w * 0.5, rect.h * 0.5);
+        // The quad reaches `pad` past the shape; `uv` is measured from the
+        // centre to those padded corners, while `params` keep the shape.
+        let (ew, eh) = (hw + pad, hh + pad);
         let r = radius.clamp(0.0, hw.min(hh));
         let c = color.to_array();
         let params = [hw, hh, r, mode];
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&[
             UiVertex {
-                pos: [rect.x, rect.y],
-                uv: [-hw, -hh],
+                pos: [quad.x, quad.y],
+                uv: [-ew, -eh],
                 color: c,
                 params,
                 extra: QUAD_EXTRA,
             },
             UiVertex {
-                pos: [rect.x + rect.w, rect.y],
-                uv: [hw, -hh],
+                pos: [quad.x + quad.w, quad.y],
+                uv: [ew, -eh],
                 color: c,
                 params,
                 extra: QUAD_EXTRA,
             },
             UiVertex {
-                pos: [rect.x + rect.w, rect.y + rect.h],
-                uv: [hw, hh],
+                pos: [quad.x + quad.w, quad.y + quad.h],
+                uv: [ew, eh],
                 color: c,
                 params,
                 extra: QUAD_EXTRA,
             },
             UiVertex {
-                pos: [rect.x, rect.y + rect.h],
-                uv: [-hw, hh],
+                pos: [quad.x, quad.y + quad.h],
+                uv: [-ew, eh],
                 color: c,
                 params,
                 extra: QUAD_EXTRA,
@@ -669,10 +701,16 @@ impl DrawList {
         self.push_cmd(CmdTexture::White, 6);
     }
 
-    /// A rounded rectangle with a 1px (or `border`) stroke: the border
-    /// colour fills `rect`, then the fill colour is inset by `border`. This
-    /// is how panels and fields get a hairline edge without a second
-    /// geometry path.
+    /// A rounded rectangle with a 1px (or `border`) stroke: the ring of
+    /// `stroke` is drawn on `rect`'s edge, `border` pixels deep, and the
+    /// `fill` sits under it. Under an opaque stroke the fill is inset by
+    /// `border * 0.5` on every side (its radius shrinks by the same amount,
+    /// clamped at 0), so its anti-aliased edge lands under the middle of the
+    /// ring rather than on the outer edge where the fill colour would bleed
+    /// out as a halo. Otherwise (no stroke, or a translucent one that must
+    /// tint over the fill) the fill covers the full `rect`. A transparent `fill` draws nothing, so a field with
+    /// only a border (a text box inside a bar) does not paint its stroke
+    /// colour across the whole interior.
     pub fn rounded_frame(
         &mut self,
         rect: Rect,
@@ -681,13 +719,19 @@ impl DrawList {
         fill: Color,
         stroke: Color,
     ) {
-        // A transparent fill draws nothing, so a field with only a border
-        // (a text box inside a bar) no longer paints its stroke colour across
-        // the whole interior.
+        let stroked = border > 0.0 && stroke.a > 0;
         if fill.a > 0 {
-            self.round_rect(rect, radius, fill);
+            // Only an opaque ring can hide the fill's edge; under a
+            // translucent ring the fill must reach the outer edge (CSS
+            // paints the background under the whole border box).
+            if stroked && stroke.a == 255 {
+                let inset = border * 0.5;
+                self.round_rect(rect.inset(inset), (radius - inset).max(0.0), fill);
+            } else {
+                self.round_rect(rect, radius, fill);
+            }
         }
-        if border > 0.0 && stroke.a > 0 {
+        if stroked {
             self.round_ring(rect, radius, border, stroke);
         }
     }
@@ -742,47 +786,76 @@ impl DrawList {
         radius: f32,
         uv: (f32, f32, f32, f32),
     ) {
-        if tint.a == 0 || rect.w <= 0.0 || rect.h <= 0.0 || self.culled(rect) {
+        self.push_shape_image(
+            rect,
+            CmdTexture::Custom(Arc::clone(texture)),
+            tint,
+            radius,
+            uv,
+        );
+    }
+
+    /// Geometry behind [`Self::image_uv_rect`], over any texture so the
+    /// vertex layout can be tested without a GPU.
+    fn push_shape_image(
+        &mut self,
+        rect: Rect,
+        texture: CmdTexture,
+        tint: Color,
+        radius: f32,
+        uv: (f32, f32, f32, f32),
+    ) {
+        let pad = self.aa_pad();
+        let quad = rect.expand(pad);
+        if tint.a == 0 || rect.w <= 0.0 || rect.h <= 0.0 || self.culled(quad) {
             return;
         }
         let r = radius.clamp(0.0, (rect.w * 0.5).min(rect.h * 0.5));
+        // `params` keep the unpadded full size; the shader finds the shape
+        // from the padded quad origin by stepping back `extra` = pad.
         let params = [rect.w, rect.h, r, 2.0];
+        let extra = [pad, pad];
         let c = tint.to_array();
+        // Extend the texture range linearly over the pad, so the padded
+        // corners sample just past the shape's own UV edges.
         let (u0, v0, u1, v1) = uv;
+        let du = pad * (u1 - u0) / rect.w;
+        let dv = pad * (v1 - v0) / rect.h;
+        let (u0, v0, u1, v1) = (u0 - du, v0 - dv, u1 + du, v1 + dv);
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&[
             UiVertex {
-                pos: [rect.x, rect.y],
+                pos: [quad.x, quad.y],
                 uv: [u0, v0],
                 color: c,
                 params,
-                extra: QUAD_EXTRA,
+                extra,
             },
             UiVertex {
-                pos: [rect.x + rect.w, rect.y],
+                pos: [quad.x + quad.w, quad.y],
                 uv: [u1, v0],
                 color: c,
                 params,
-                extra: QUAD_EXTRA,
+                extra,
             },
             UiVertex {
-                pos: [rect.x + rect.w, rect.y + rect.h],
+                pos: [quad.x + quad.w, quad.y + quad.h],
                 uv: [u1, v1],
                 color: c,
                 params,
-                extra: QUAD_EXTRA,
+                extra,
             },
             UiVertex {
-                pos: [rect.x, rect.y + rect.h],
+                pos: [quad.x, quad.y + quad.h],
                 uv: [u0, v1],
                 color: c,
                 params,
-                extra: QUAD_EXTRA,
+                extra,
             },
         ]);
         self.indices
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        self.push_cmd(CmdTexture::Custom(Arc::clone(texture)), 6);
+        self.push_cmd(texture, 6);
     }
 
     /// Soft-edged shadow (or glow) under a rounded rectangle.
@@ -1047,43 +1120,48 @@ impl DrawList {
     /// the shape (mode 1) while the colour interpolates across the corners,
     /// so a rounded panel with a sheen is still one quad.
     pub fn round_rect_gradient(&mut self, rect: Rect, radius: f32, corners: [Color; 4]) {
+        let pad = self.aa_pad();
+        let quad = rect.expand(pad);
         if rect.w <= 0.0
             || rect.h <= 0.0
-            || self.culled(rect)
+            || self.culled(quad)
             || corners.iter().all(|color| color.a == 0)
         {
             return;
         }
         let (hw, hh) = (rect.w * 0.5, rect.h * 0.5);
+        // Padded corners carry the outer colours too: the gradient runs a
+        // hair past the rect, which the one-pixel band hides.
+        let (ew, eh) = (hw + pad, hh + pad);
         let r = radius.clamp(0.0, hw.min(hh));
         let params = [hw, hh, r, 1.0];
         let [tl, tr, br, bl] = corners;
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&[
             UiVertex {
-                pos: [rect.x, rect.y],
-                uv: [-hw, -hh],
+                pos: [quad.x, quad.y],
+                uv: [-ew, -eh],
                 color: tl.to_array(),
                 params,
                 extra: QUAD_EXTRA,
             },
             UiVertex {
-                pos: [rect.x + rect.w, rect.y],
-                uv: [hw, -hh],
+                pos: [quad.x + quad.w, quad.y],
+                uv: [ew, -eh],
                 color: tr.to_array(),
                 params,
                 extra: QUAD_EXTRA,
             },
             UiVertex {
-                pos: [rect.x + rect.w, rect.y + rect.h],
-                uv: [hw, hh],
+                pos: [quad.x + quad.w, quad.y + quad.h],
+                uv: [ew, eh],
                 color: br.to_array(),
                 params,
                 extra: QUAD_EXTRA,
             },
             UiVertex {
-                pos: [rect.x, rect.y + rect.h],
-                uv: [-hw, hh],
+                pos: [quad.x, quad.y + quad.h],
+                uv: [-ew, eh],
                 color: bl.to_array(),
                 params,
                 extra: QUAD_EXTRA,
@@ -1107,44 +1185,49 @@ impl DrawList {
         from: Color,
         to: Color,
     ) {
-        if (from.a == 0 && to.a == 0) || rect.w <= 0.0 || rect.h <= 0.0 || self.culled(rect) {
+        let pad = self.aa_pad();
+        let quad = rect.expand(pad);
+        if (from.a == 0 && to.a == 0) || rect.w <= 0.0 || rect.h <= 0.0 || self.culled(quad) {
             return;
         }
         let packed = f32::from_bits(u32::from_le_bytes(to.to_array()));
         let outer = outer_radius.clamp(0.0, (rect.w * 0.5).min(rect.h * 0.5));
         let inner = inner_radius.clamp(0.0, outer);
+        // As for mode 2: `params` keep the unpadded size and `extra` steps
+        // the shader from the padded quad origin back to the rect's origin.
         let params = [rect.w, rect.h, outer, -2.0];
+        let extra = [pad, pad];
         let uv = [packed, inner];
         let c = from.to_array();
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&[
             UiVertex {
-                pos: [rect.x, rect.y],
+                pos: [quad.x, quad.y],
                 uv,
                 color: c,
                 params,
-                extra: QUAD_EXTRA,
+                extra,
             },
             UiVertex {
-                pos: [rect.x + rect.w, rect.y],
+                pos: [quad.x + quad.w, quad.y],
                 uv,
                 color: c,
                 params,
-                extra: QUAD_EXTRA,
+                extra,
             },
             UiVertex {
-                pos: [rect.x + rect.w, rect.y + rect.h],
+                pos: [quad.x + quad.w, quad.y + quad.h],
                 uv,
                 color: c,
                 params,
-                extra: QUAD_EXTRA,
+                extra,
             },
             UiVertex {
-                pos: [rect.x, rect.y + rect.h],
+                pos: [quad.x, quad.y + quad.h],
                 uv,
                 color: c,
                 params,
-                extra: QUAD_EXTRA,
+                extra,
             },
         ]);
         self.indices
@@ -1326,47 +1409,48 @@ impl DrawList {
         self.push_cmd(CmdTexture::White, 6);
     }
 
-    /// Filled circle as a triangle fan.
+    /// Filled, anti-aliased circle — the same single SDF quad as
+    /// [`Self::fill_circle`]. `segments` is ignored (the SDF edge is exact
+    /// at any size) and kept only so existing callers still compile.
     pub fn circle(&mut self, center: (f32, f32), radius: f32, color: Color, segments: u32) {
-        if color.a == 0
-            || radius <= 0.0
-            || self.culled(Rect::new(
-                center.0 - radius,
-                center.1 - radius,
-                radius * 2.0,
-                radius * 2.0,
-            ))
-        {
+        let _ = segments;
+        self.fill_circle(center, radius, color);
+    }
+
+    /// Filled, anti-aliased circle of `radius` around `center`, as one SDF
+    /// quad. Non-positive radii draw nothing.
+    pub fn fill_circle(&mut self, center: (f32, f32), radius: f32, color: Color) {
+        let (cx, cy) = center;
+        self.round_rect(
+            Rect::new(cx - radius, cy - radius, radius * 2.0, radius * 2.0),
+            radius,
+            color,
+        );
+    }
+
+    /// Anti-aliased circle outline. `radius` is the outer edge; the band
+    /// runs `thickness` pixels inward (a `thickness` at or beyond `radius`
+    /// fills the disc). Non-positive thickness draws nothing. Built on
+    /// [`Self::round_ring`], so it is one SDF quad.
+    pub fn stroke_circle(&mut self, center: (f32, f32), radius: f32, thickness: f32, color: Color) {
+        if thickness <= 0.0 {
             return;
         }
-        let segments = segments.max(8);
-        let base = self.vertices.len() as u32;
-        let c = color.to_array();
-        self.vertices.push(UiVertex {
-            pos: [center.0, center.1],
-            uv: [0.5, 0.5],
-            color: c,
-            params: QUAD_PARAMS,
-            extra: QUAD_EXTRA,
-        });
-        for i in 0..=segments {
-            let angle = i as f32 / segments as f32 * std::f32::consts::TAU;
-            self.vertices.push(UiVertex {
-                pos: [
-                    center.0 + angle.cos() * radius,
-                    center.1 + angle.sin() * radius,
-                ],
-                uv: [0.5, 0.5],
-                color: c,
-                params: QUAD_PARAMS,
-                extra: QUAD_EXTRA,
-            });
-        }
-        for i in 0..segments {
-            self.indices
-                .extend_from_slice(&[base, base + 1 + i, base + 2 + i]);
-        }
-        self.push_cmd(CmdTexture::White, segments * 3);
+        let (cx, cy) = center;
+        self.round_ring(
+            Rect::new(cx - radius, cy - radius, radius * 2.0, radius * 2.0),
+            radius,
+            thickness,
+            color,
+        );
+    }
+
+    /// Filled pill: a rounded rectangle whose corner radius is half its
+    /// shorter side, so a square becomes a circle and a wide rect becomes a
+    /// stadium. True ellipses (unequal radii on both axes) are not
+    /// supported — this always draws circular ends.
+    pub fn pill(&mut self, rect: Rect, color: Color) {
+        self.round_rect(rect, rect.w.min(rect.h) * 0.5, color);
     }
 
     /// Raw triangles — the escape hatch. Vertex positions are pixel space;
@@ -1511,7 +1595,9 @@ impl DrawList {
     /// When a scale is set, every vertex position, scissor, shape parameter
     /// and shape local coordinate is multiplied by it before the frame is
     /// emitted. Only texture UVs remain unscaled; cropped-image
-    /// dimensions/radius (`params.w == 2`) are pixel-space and scale too.
+    /// dimensions/radius (`params.w == 2`) are pixel-space and scale too,
+    /// and so is the anti-aliasing pad in `extra` for modes `2` and `-2`
+    /// (it is a length, the step from the quad origin to the shape).
     ///
     /// Fast path: when the commands were already submitted in layer order
     /// (the common case — layers are pushed deliberately), the buffers move
@@ -1546,6 +1632,9 @@ impl DrawList {
                     vertex.params[0] *= scale;
                     vertex.params[1] *= scale;
                     vertex.params[2] *= scale;
+                    // The pad from the quad origin to the shape: a length.
+                    vertex.extra[0] *= scale;
+                    vertex.extra[1] *= scale;
                 } else if vertex.params[3] > 2.5 {
                     vertex.params[0] *= scale;
                     vertex.params[1] *= scale;
@@ -1569,6 +1658,9 @@ impl DrawList {
                     vertex.params[1] *= scale;
                     vertex.params[2] *= scale;
                     vertex.uv[1] *= scale;
+                    // Origin pad (see mode 2): a length.
+                    vertex.extra[0] *= scale;
+                    vertex.extra[1] *= scale;
                 } else if vertex.params[3] == ARC_MODE {
                     // Arc stroke: the mid radius and half thickness are
                     // lengths and uv is the centre-relative position. The
@@ -1665,10 +1757,90 @@ mod tests {
         d.round_ring(Rect::new(10.0, 10.0, 20.0, 10.0), 4.0, 1.5, Color::WHITE);
         let frame = d.finish((100.0, 100.0));
         let v = frame.vertices[0];
-        assert_eq!(v.pos, [20.0, 20.0]);
-        assert_eq!(v.uv, [-20.0, -10.0], "SDF local coords are physical");
+        // The quad is padded by one physical pixel: 10 - 0.5 logical -> 19.
+        assert_eq!(v.pos, [19.0, 19.0]);
+        assert_eq!(v.uv, [-21.0, -11.0], "padded SDF local coords are physical");
         // half_w, half_h, radius and the band are all physical: 1.5 -> 3.0.
         assert_eq!(v.params, [20.0, 10.0, 8.0, 6.0]);
+    }
+
+    #[test]
+    fn rounded_frame_fill_sits_inside_the_border() {
+        let white = Color::WHITE;
+        let black = Color::BLACK;
+        // 40x20 at radius 6 with a 2 px border: the fill is inset by 1 px
+        // and its radius drops by 1, so it sits under the ring's middle.
+        let mut d = DrawList::new();
+        d.begin((100.0, 100.0));
+        d.rounded_frame(Rect::new(10.0, 10.0, 40.0, 20.0), 6.0, 2.0, white, black);
+        let frame = d.finish((100.0, 100.0));
+        // Fill first (mode 1), then the ring (mode 3 + thickness).
+        assert_eq!(frame.vertices[0].params, [19.0, 9.0, 5.0, 1.0]);
+        assert_eq!(frame.vertices[4].params[3], 5.0);
+        assert_eq!(frame.vertices[4].params[..3], [20.0, 10.0, 6.0]);
+
+        // A radius below the inset clamps the fill's radius at zero.
+        let mut d = DrawList::new();
+        d.begin((100.0, 100.0));
+        d.rounded_frame(Rect::new(10.0, 10.0, 40.0, 20.0), 0.5, 2.0, white, black);
+        let frame = d.finish((100.0, 100.0));
+        assert_eq!(frame.vertices[0].params[2], 0.0);
+
+        // No border (or a transparent stroke): the fill keeps the full rect.
+        let mut d = DrawList::new();
+        d.begin((100.0, 100.0));
+        d.rounded_frame(Rect::new(10.0, 10.0, 40.0, 20.0), 6.0, 0.0, white, black);
+        d.rounded_frame(
+            Rect::new(10.0, 40.0, 40.0, 20.0),
+            6.0,
+            2.0,
+            white,
+            Color::TRANSPARENT,
+        );
+        let frame = d.finish((100.0, 100.0));
+        assert_eq!(frame.vertices[0].params, [20.0, 10.0, 6.0, 1.0]);
+        assert_eq!(frame.quad_count(), 2);
+
+        // A translucent stroke tints over the fill, so the fill keeps the
+        // full rect (the CSS border box).
+        let mut d = DrawList::new();
+        d.begin((100.0, 100.0));
+        d.rounded_frame(
+            Rect::new(10.0, 10.0, 40.0, 20.0),
+            6.0,
+            2.0,
+            white,
+            Color::rgba(0, 0, 0, 40),
+        );
+        let frame = d.finish((100.0, 100.0));
+        assert_eq!(frame.vertices[0].params, [20.0, 10.0, 6.0, 1.0]);
+    }
+
+    #[test]
+    fn square_round_rect_under_rounded_clip_is_carved() {
+        let mut d = DrawList::new();
+        d.begin((100.0, 100.0));
+        d.push_clip_rounded(Rect::new(0.0, 0.0, 50.0, 50.0), 8.0);
+        d.round_rect(Rect::new(5.0, 5.0, 20.0, 20.0), 0.0, Color::WHITE);
+        let frame = d.finish((100.0, 100.0));
+        assert_eq!(frame.vertices[0].params[3], -1.0);
+        assert_eq!(frame.vertices.len(), 4);
+
+        // A rounded shape keeps its own SDF geometry under the same clip.
+        let mut d = DrawList::new();
+        d.begin((100.0, 100.0));
+        d.push_clip_rounded(Rect::new(0.0, 0.0, 50.0, 50.0), 8.0);
+        d.round_rect(Rect::new(5.0, 5.0, 20.0, 20.0), 4.0, Color::WHITE);
+        let frame = d.finish((100.0, 100.0));
+        assert_eq!(frame.vertices[0].params[3], 1.0);
+
+        // And a square shape with no rounded clip stays on the SDF path.
+        let mut d = DrawList::new();
+        d.begin((100.0, 100.0));
+        d.push_clip(Rect::new(0.0, 0.0, 50.0, 50.0));
+        d.round_rect(Rect::new(5.0, 5.0, 20.0, 20.0), 0.0, Color::WHITE);
+        let frame = d.finish((100.0, 100.0));
+        assert_eq!(frame.vertices[0].params[3], 1.0);
     }
 
     fn rect() -> Rect {
@@ -1749,7 +1921,101 @@ mod tests {
         list.circle((50.0, 50.0), 10.0, Color::WHITE, 16);
         let frame = list.finish((100.0, 100.0));
         assert_eq!(frame.cmds.len(), 1, "same texture merges into one draw");
-        assert_eq!(frame.indices.len() / 3, 2 + 16, "quad + fan triangles");
+        assert_eq!(
+            frame.indices.len() / 3,
+            2 + 2,
+            "line quad + circle SDF quad"
+        );
+    }
+
+    #[test]
+    fn sdf_quads_are_padded_for_antialiasing() {
+        for scale in [1.0_f32, 2.0] {
+            let mut list = DrawList::new();
+            list.begin((100.0, 100.0));
+            list.set_scale(scale);
+            list.round_rect(Rect::new(10.0, 10.0, 20.0, 20.0), 10.0, Color::WHITE);
+            let frame = list.finish((100.0, 100.0));
+            let v = &frame.vertices;
+            // One physical pixel past every edge, in physical units.
+            let pad = 1.0;
+            let (lo, hi) = (10.0 * scale - pad, 30.0 * scale + pad);
+            assert_eq!(v[0].pos, [lo, lo], "scale {scale}: top-left");
+            assert_eq!(v[2].pos, [hi, hi], "scale {scale}: bottom-right");
+            // uv is centre-relative over the padded corners ...
+            let half = 10.0 * scale + pad;
+            assert_eq!(v[0].uv, [-half, -half], "scale {scale}");
+            assert_eq!(v[2].uv, [half, half], "scale {scale}");
+            // ... while params keep the unpadded half size and radius.
+            let shape = 10.0 * scale;
+            assert_eq!(v[0].params, [shape, shape, shape, 1.0], "scale {scale}");
+        }
+    }
+
+    #[test]
+    fn rounded_image_pad_rides_in_extra() {
+        let mut list = DrawList::new();
+        list.begin((100.0, 100.0));
+        list.set_scale(2.0);
+        // Textures can't be built without a GPU, so test the shared helper
+        // with a stand-in texture: the geometry is identical.
+        list.push_shape_image(
+            Rect::new(10.0, 10.0, 20.0, 10.0),
+            CmdTexture::White,
+            Color::WHITE,
+            4.0,
+            (0.0, 0.0, 1.0, 0.5),
+        );
+        let frame = list.finish((100.0, 100.0));
+        let v = &frame.vertices;
+        // Physical rect is 20..60 x 20..40; the quad adds one physical pixel.
+        assert_eq!(v[0].pos, [19.0, 19.0]);
+        assert_eq!(v[2].pos, [61.0, 41.0]);
+        // Params keep the unpadded full size and radius (all physical).
+        assert_eq!(v[0].params, [40.0, 20.0, 8.0, 2.0]);
+        // The pad is a length, so finish scales it to one physical pixel,
+        // and the quad origin plus pad lands back on the shape's origin.
+        assert_eq!(v[0].extra, [1.0, 1.0]);
+        assert_eq!(v[0].pos[0] + v[0].extra[0], 20.0);
+        assert_eq!(v[0].pos[1] + v[0].extra[1], 20.0);
+        // UVs extend over the pad (0.5 logical on a 20x10 rect): the
+        // padded corners sample just outside the 0..1 x 0..0.5 range.
+        let eps = 1e-6;
+        let du = 0.5 / 20.0;
+        let dv = 0.5 * 0.5 / 10.0;
+        assert!((v[0].uv[0] + du).abs() < eps && (v[0].uv[1] + dv).abs() < eps);
+        assert!((v[2].uv[0] - (1.0 + du)).abs() < eps && (v[2].uv[1] - (0.5 + dv)).abs() < eps);
+    }
+
+    #[test]
+    fn circle_uses_sdf_quad() {
+        let mut list = DrawList::new();
+        list.begin((100.0, 100.0));
+        // `segments` is ignored: the same SDF quad whatever it is.
+        list.circle((50.0, 50.0), 10.0, Color::WHITE, 3);
+        let frame = list.finish((100.0, 100.0));
+        assert_eq!(frame.vertices.len(), 4);
+        assert_eq!(frame.indices.len(), 6);
+        // Radius 10 on a 20-square: half size 10, radius 10, mode 1.
+        assert_eq!(frame.vertices[0].params, [10.0, 10.0, 10.0, 1.0]);
+    }
+
+    #[test]
+    fn circle_api_variants_use_sdf_modes() {
+        let mut list = DrawList::new();
+        list.begin((100.0, 100.0));
+        list.fill_circle((20.0, 20.0), 5.0, Color::WHITE);
+        list.stroke_circle((60.0, 20.0), 8.0, 2.0, Color::WHITE);
+        list.stroke_circle((20.0, 60.0), 8.0, 0.0, Color::WHITE); // nothing
+        list.pill(Rect::new(40.0, 50.0, 30.0, 10.0), Color::WHITE);
+        let frame = list.finish((100.0, 100.0));
+        assert_eq!(frame.vertices.len(), 12, "three shapes, four corners each");
+        // Filled circle: mode 1, radius = half side.
+        assert_eq!(frame.vertices[0].params, [5.0, 5.0, 5.0, 1.0]);
+        // Outline: mode 3 + thickness, outer radius 8, band 2 px inward.
+        assert_eq!(frame.vertices[4].params, [8.0, 8.0, 8.0, 5.0]);
+        // Pill: radius is half the shorter side (5 for a 30x10 rect).
+        assert_eq!(frame.vertices[8].params, [15.0, 5.0, 5.0, 1.0]);
     }
 
     #[test]

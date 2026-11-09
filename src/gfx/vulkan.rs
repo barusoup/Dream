@@ -26,7 +26,7 @@ pub use barriers::{
 };
 pub use mesh::{DynamicBuffers, PulledMesh};
 pub use shared::TextureObjectStats;
-pub use swapchain::Swapchain;
+pub use swapchain::{PresentMode, Swapchain, SwapchainOptions};
 
 /// Frames the CPU may have in flight at once. Three slots give the loop
 /// enough slack to ride out a presentation-engine hiccup (an older frame's
