@@ -39,3 +39,4 @@ the full suite is the final confirmation, not the edit loop.
 - `cargo run --release --bin bedframe_gpu_bench` — real Vulkan UI-only versus scene-under-opaque-UI CPU recording/submission timings and live allocator bytes. These are not GPU execution timings or complete driver memory.
 - `cargo run --release --bin bedframe_check` — GPU readback/pixel regressions; screenshots go under `target/bedframe-check/`.
 - `cargo run --release --bin dream_app -- --selfcheck` — app navigation, thumbnails, rendering, idle/wake, and hidden-window checks.
+- `cargo run --release --bin bedframe_mem_probe` — resident memory of a UI-only Vulkan app at each start-up stage, then the hot set after `dream::memory::trim_working_set`.

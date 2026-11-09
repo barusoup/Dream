@@ -18,9 +18,9 @@
 //! ```
 
 use dream::camera::Camera;
-use dream::gfx::Renderer;
+use dream::gfx::{GpuContext, Renderer};
 use dream::settings::{AaMode, Settings, UpscalePreset};
-use dream::texture::{GpuTexture, TextureOptions};
+use dream::texture::{GpuTexture, TextureManager, TextureOptions};
 use dream::ui::atlas::AtlasConfig;
 use dream::ui::draw::UiFrame;
 use dream::ui::font::{FontId, Fonts};
@@ -1864,6 +1864,67 @@ impl Check {
     }
 }
 
+/// Textures share one sampler per description and descriptor pool chunks,
+/// instead of each owning a sampler, two set layouts and a pool.
+fn check_texture_objects_are_shared(ctx: &Arc<GpuContext>) {
+    const COUNT: usize = 600;
+    const SETS_PER_CHUNK_TEXTURES: usize = 128;
+    let before = ctx.texture_object_stats();
+    let pixels: Vec<u8> = [32u8, 64, 128, 255]
+        .into_iter()
+        .cycle()
+        .take(4 * 4 * 4)
+        .collect();
+    let mut manager = TextureManager::new(Arc::clone(ctx));
+    let mut textures: Vec<Arc<GpuTexture>> = Vec::with_capacity(COUNT);
+    for _ in 0..COUNT {
+        let (_, texture) =
+            manager.from_pixels("shared texture", &pixels, 4, 4, TextureOptions::default());
+        textures.push(texture);
+    }
+    // The manager's own references go too; only `textures` keeps them alive.
+    drop(manager);
+    let during = ctx.texture_object_stats();
+    assert!(
+        during.samplers <= 3 && during.samplers <= before.samplers + 1,
+        "[texture_objects_are_shared] samplers {} -> {} for {COUNT} default textures",
+        before.samplers,
+        during.samplers
+    );
+    let max_new_pools = COUNT.div_ceil(SETS_PER_CHUNK_TEXTURES);
+    assert!(
+        during.descriptor_pools <= before.descriptor_pools + max_new_pools,
+        "[texture_objects_are_shared] pools {} -> {}, expected at most {max_new_pools} new",
+        before.descriptor_pools,
+        during.descriptor_pools
+    );
+    assert_eq!(
+        during.live_texture_sets,
+        before.live_texture_sets + COUNT,
+        "[texture_objects_are_shared] live texture sets"
+    );
+    drop(textures);
+    let after = ctx.texture_object_stats();
+    assert_eq!(
+        after.live_texture_sets, before.live_texture_sets,
+        "[texture_objects_are_shared] live texture sets after drop"
+    );
+    assert!(
+        after.descriptor_pools <= before.descriptor_pools,
+        "[texture_objects_are_shared] pools {} after drop, was {}",
+        after.descriptor_pools,
+        before.descriptor_pools
+    );
+    println!(
+        "[check] texture_objects_are_shared: {COUNT} textures, samplers {} -> {}, pools {} -> {} -> {}",
+        before.samplers,
+        during.samplers,
+        before.descriptor_pools,
+        during.descriptor_pools,
+        after.descriptor_pools
+    );
+}
+
 impl ApplicationHandler for Check {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
@@ -1905,6 +1966,7 @@ impl ApplicationHandler for Check {
             8,
             TextureOptions::default(),
         ));
+        check_texture_objects_are_shared(&ctx);
         self.renderer = Some(renderer);
         self.ui = Some(ui);
         self.texture = Some(texture);

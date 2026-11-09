@@ -1,5 +1,5 @@
 use super::decode::mip_levels_for;
-use super::sampler::{SamplerDesc, create_sampler};
+use super::sampler::SamplerDesc;
 use super::{TextureFormat, TextureOptions};
 use crate::gfx::vulkan::{self, GpuContext, GpuImage};
 use ash::vk;
@@ -63,13 +63,13 @@ pub fn create_sampled_texture_set_layout(ctx: &GpuContext) -> vk::DescriptorSetL
 pub struct GpuTexture {
     pub(super) ctx: Arc<GpuContext>,
     pub(super) image: GpuImage,
+    /// Shared with every texture of the same description; owned by the context.
     sampler: vk::Sampler,
-    layout: vk::DescriptorSetLayout,
+    /// Descriptor pool chunk the two sets below came from; needed to free them.
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     /// Engine-WGSL set: `SAMPLED_IMAGE` at 0, `SAMPLER` at 1 — see
     /// [`SAMPLED_TEXTURE_SET_BINDINGS`].
-    sampled_layout: vk::DescriptorSetLayout,
     sampled_set: vk::DescriptorSet,
     pub(super) width: u32,
     pub(super) height: u32,
@@ -169,7 +169,6 @@ impl GpuTexture {
 
         Self::finish(
             ctx,
-            label,
             image,
             options.sampler,
             (width, height),
@@ -244,7 +243,6 @@ impl GpuTexture {
         });
         Self::finish(
             ctx,
-            label,
             image,
             options.sampler,
             (width, height),
@@ -287,20 +285,11 @@ impl GpuTexture {
             | vk::ImageUsageFlags::TRANSFER_SRC;
         let image =
             ctx.create_image_swizzled(label, size.0.max(1), size.1.max(1), format, usage, swizzle);
-        Self::finish(
-            ctx,
-            label,
-            image,
-            sampler_desc,
-            size,
-            1,
-            (public_format, format),
-        )
+        Self::finish(ctx, image, sampler_desc, size, 1, (public_format, format))
     }
 
     fn finish(
         ctx: &Arc<GpuContext>,
-        label: &str,
         image: GpuImage,
         sampler_desc: SamplerDesc,
         size: (u32, u32),
@@ -309,42 +298,8 @@ impl GpuTexture {
     ) -> Self {
         let (width, height) = size;
         let (format, vk_format) = formats;
-        let sampler = create_sampler(ctx, label, sampler_desc, mip_levels);
-        let layout = create_texture_set_layout(ctx);
-        let sampled_layout = create_sampled_texture_set_layout(ctx);
-        // One pool backs both sets: the legacy combined contract and the
-        // engine-WGSL sampled contract.
-        let pool_sizes = [
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(1),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1),
-        ];
-        let pool = unsafe {
-            ctx.device().create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(2)
-                    .pool_sizes(&pool_sizes),
-                None,
-            )
-        }
-        .expect("texture descriptor pool");
-        let [set, sampled_set] = unsafe {
-            let sets = ctx.device().allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(pool)
-                    .set_layouts(&[layout, sampled_layout]),
-            );
-            match sets.expect("texture descriptor sets").as_slice() {
-                &[set, sampled_set] => [set, sampled_set],
-                _ => panic!("texture descriptor allocation returned wrong count"),
-            }
-        };
+        let sampler = ctx.shared_sampler(sampler_desc, mip_levels);
+        let (pool, [set, sampled_set]) = ctx.alloc_texture_sets();
         let combined = vk::DescriptorImageInfo::default()
             .sampler(sampler)
             .image_view(image.view)
@@ -375,10 +330,8 @@ impl GpuTexture {
             ctx: Arc::clone(ctx),
             image,
             sampler,
-            layout,
             pool,
             set,
-            sampled_layout,
             sampled_set,
             width,
             height,
@@ -450,13 +403,9 @@ impl GpuTexture {
 
 impl Drop for GpuTexture {
     fn drop(&mut self) {
-        unsafe {
-            let device = self.ctx.device();
-            device.destroy_descriptor_pool(self.pool, None);
-            device.destroy_descriptor_set_layout(self.layout, None);
-            device.destroy_descriptor_set_layout(self.sampled_layout, None);
-            device.destroy_sampler(self.sampler, None);
-        }
+        // The sampler, layouts and pool chunk are shared: the context owns them.
+        self.ctx
+            .free_texture_sets(self.pool, [self.set, self.sampled_set]);
     }
 }
 
