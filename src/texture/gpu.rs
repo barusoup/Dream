@@ -266,6 +266,89 @@ impl GpuTexture {
         )
     }
 
+    /// A blank, linearly sampled texture that can also be drawn into and copied
+    /// to or from, in the caller's exact Vulkan format. Used for the UI's
+    /// frosted-glass backdrop, whose targets must match the display image's
+    /// format.
+    ///
+    /// The clear to transparent black is recorded into `cmd`, not submitted on
+    /// its own, so creating one never stalls the frame it is made in. The
+    /// texture is defined once `cmd` has been submitted, and it must be used
+    /// only by work submitted after that.
+    pub fn render_target(
+        ctx: &Arc<GpuContext>,
+        cmd: vk::CommandBuffer,
+        label: &str,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Self {
+        let usage = vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let image = ctx.create_image_mips(label, width, height, format, usage, 1);
+        let device = ctx.device();
+        let raw = image.image;
+        unsafe {
+            vulkan::image_barrier(
+                device,
+                cmd,
+                raw,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::ImageAspectFlags::COLOR,
+            );
+            device.cmd_clear_color_image(
+                cmd,
+                raw,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 0.0],
+                },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+            vulkan::image_barrier(
+                device,
+                cmd,
+                raw,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                vk::ImageAspectFlags::COLOR,
+            );
+        }
+        // Linear and clamped: the blur reads neighbours, and the glass is
+        // sampled at fractional UVs.
+        let sampler = SamplerDesc {
+            filter: super::sampler::Filter::Linear,
+            mip: super::sampler::MipFilter::Linear,
+            address: super::sampler::AddressMode::ClampToEdge,
+            anisotropy: false,
+        };
+        Self::finish(
+            ctx,
+            image,
+            sampler,
+            (width, height),
+            1,
+            (TextureFormat::Linear, format),
+        )
+    }
+
     /// An image with sampler and descriptor sets but no contents and no
     /// upload: the caller transitions UNDEFINED itself and records the
     /// first copy. `format` is the *actual* Vulkan format (coverage pages

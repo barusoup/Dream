@@ -10,6 +10,7 @@
 //! frame slot and are only written after that slot's fence recycled, matching
 //! the engine's scene-uniform convention.
 
+mod backdrop;
 mod prepare;
 
 use super::draw::{DrawCmd, UiFrame, UiVertex};
@@ -155,6 +156,10 @@ pub struct UiRenderer {
     pipeline: vk::Pipeline,
     /// Private instanced-quad pipeline (same layout/dsl/push).
     instance_pipeline: vk::Pipeline,
+    /// Frosted-glass variants of `pipeline` and `instance_pipeline`. Equal to
+    /// them in linear mode; see the note in `new_with_blend`.
+    backdrop_pipeline: vk::Pipeline,
+    backdrop_instance_pipeline: vk::Pipeline,
     /// Compact instancing path — `set_instancing(false)` renders the old
     /// raw-indexed path byte-for-byte.
     instancing: bool,
@@ -162,6 +167,10 @@ pub struct UiRenderer {
     dsl: vk::DescriptorSetLayout,
     white: Arc<GpuTexture>,
     slots: Vec<FrameSlot>,
+    /// Frosted-glass backdrop textures, one set per frame slot, made on first use.
+    backdrop: Vec<Option<backdrop::Backdrop>>,
+    backdrop_format: vk::Format,
+    blur: backdrop::BlurPipelines,
     /// GPU memory of the atlas identity the last frame carried.
     atlas: Option<AtlasGpu>,
     page_size: u32,
@@ -321,22 +330,59 @@ impl UiRenderer {
                 c"fs_linear"
             },
         );
+        // Frosted glass samples its backdrop undecoded. In gamma mode the
+        // shared fragment entries re-encode every sample, so glass needs its
+        // own entry that decodes first (`fs_backdrop`). Linear mode already
+        // samples raw and shares the ordinary pipelines.
+        let (backdrop_pipeline, backdrop_instance_pipeline) = if gamma {
+            (
+                create_ui_pipeline(
+                    ctx,
+                    shader,
+                    &binding,
+                    &attrs,
+                    layout,
+                    format,
+                    c"vs_main",
+                    c"fs_backdrop",
+                ),
+                create_ui_pipeline(
+                    ctx,
+                    shader,
+                    &instance_binding,
+                    &instance_attrs,
+                    layout,
+                    format,
+                    c"vs_instance_gamma",
+                    c"fs_backdrop",
+                ),
+            )
+        } else {
+            (pipeline, instance_pipeline)
+        };
         unsafe { ctx.device().destroy_shader_module(shader, None) };
 
         let white = Arc::new(GpuTexture::white(ctx));
-        let slots = (0..ctx.max_frames_in_flight())
+        let slots: Vec<FrameSlot> = (0..ctx.max_frames_in_flight())
             .map(|_| new_slot(ctx, 8 * 1024, 4 * 1024))
             .collect();
+        let backdrop = (0..slots.len()).map(|_| None).collect();
+        let blur = backdrop::BlurPipelines::new(ctx, dsl, format);
 
         Self {
             ctx: Arc::clone(ctx),
             pipeline,
             instance_pipeline,
+            backdrop_pipeline,
+            backdrop_instance_pipeline,
             instancing: true,
             layout,
             dsl,
             white,
             slots,
+            backdrop,
+            backdrop_format: format,
+            blur,
             atlas: None,
             page_size,
             draws: 0,
@@ -380,10 +426,17 @@ impl UiRenderer {
     /// window, minimised) calls this so it holds only its start-up footprint.
     ///
     /// The caller guarantees the GPU is idle (`device_wait_idle`): the old
-    /// buffers are freed here. Atlas pages and retained textures are not
-    /// touched.
+    /// buffers are freed here, and so are the frosted-glass backdrop textures
+    /// (they are remade on the next glass frame). Each slot's retained list is
+    /// cleared too, since it would otherwise keep those textures alive until
+    /// the slot's next record. The current atlas pages are not touched.
     pub fn trim(&mut self) {
+        for backdrop in &mut self.backdrop {
+            *backdrop = None;
+        }
         for slot in &mut self.slots {
+            slot.retained.clear();
+            slot.retained_seen.clear();
             slot.vertex_policy.reset_to_floor();
             slot.index_policy.reset_to_floor();
             slot.instances_policy.reset_to_floor();
@@ -406,6 +459,12 @@ impl UiRenderer {
     /// Record the UI pass onto `target_view` (`extent` in pixels). The target
     /// must already hold the frame underneath (load, don't clear). The target
     /// is expected in `GENERAL`; see [`Self::record_in_layout`].
+    ///
+    /// Frosted-glass ([`CmdTexture::Backdrop`](super::draw::CmdTexture::Backdrop))
+    /// draws sample their backdrop textures, but this entry point has no image
+    /// to copy from, so it does not capture one: the glass shows the last
+    /// backdrop this slot captured (blank until the first capture). Use
+    /// [`Self::record_in_layout`] with the target image to get a live backdrop.
     pub fn record(
         &mut self,
         cmd: vk::CommandBuffer,
@@ -417,6 +476,7 @@ impl UiRenderer {
         self.record_in_layout(
             cmd,
             frame_slot,
+            vk::Image::null(),
             target_view,
             extent,
             frame,
@@ -428,10 +488,18 @@ impl UiRenderer {
     /// swapchain image, `COLOR_ATTACHMENT_OPTIMAL`, when the frame is composed
     /// straight into it). The layout only changes the attachment's declared
     /// layout; the pipelines and their blending are the same.
+    ///
+    /// `target_image` is the image behind `target_view`, in `layout`. It is
+    /// copied for frosted-glass backdrops, and the copy needs it to be
+    /// blittable (`TRANSFER_SRC`). Pass `vk::Image::null()` when it is not
+    /// available: the backdrop capture is then skipped and glass shows the last
+    /// backdrop this slot captured.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_in_layout(
         &mut self,
         cmd: vk::CommandBuffer,
         frame_slot: usize,
+        target_image: vk::Image,
         target_view: vk::ImageView,
         extent: (u32, u32),
         frame: &UiFrame,
@@ -454,6 +522,15 @@ impl UiRenderer {
         //    fence has recycled by now (see the module docs), so replacing its
         //    buffer cannot disturb work still in flight.
         let slot_index = frame_slot % self.slots.len();
+        // Backdrop textures are made before the slot's retained list is cleared below. Old ones
+        // stay alive through that list until the slot's last submission has completed.
+        if frame
+            .cmds
+            .iter()
+            .any(|draw| matches!(draw.texture, super::draw::CmdTexture::Backdrop))
+        {
+            self.ensure_backdrop(slot_index, cmd, extent);
+        }
         {
             // The slot is about to be re-recorded: whatever its previous
             // submission referenced has completed by fence order.
@@ -548,7 +625,16 @@ impl UiRenderer {
                 height: extent.1,
             },
         };
-        unsafe {
+        // The pass is begun again after a backdrop capture (see below), so its
+        // setup is a closure over copies of the handles it needs, not a borrow
+        // of the slot or of `self`.
+        let pipeline = self.pipeline;
+        let pipeline_layout = self.layout;
+        let vertex_buffer = slot.vertices.buffer;
+        let index_buffer = slot.indices.buffer;
+        let instance_buffer = slot.instances.buffer;
+        let push = [frame.size.0, frame.size.1];
+        let begin_pass = |cmd: vk::CommandBuffer| unsafe {
             device.cmd_begin_rendering(
                 cmd,
                 &vk::RenderingInfo::default()
@@ -572,21 +658,22 @@ impl UiRenderer {
                     max_depth: 1.0,
                 }],
             );
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-            device.cmd_bind_vertex_buffers(cmd, 0, &[slot.vertices.buffer], &[0]);
-            device.cmd_bind_index_buffer(cmd, slot.indices.buffer, 0, vk::IndexType::UINT32);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
+            device.cmd_bind_index_buffer(cmd, index_buffer, 0, vk::IndexType::UINT32);
             // Instance lane shares vertex buffer slot 0; its bind happens
             // lazily on the first instanced draw below.
-            device.cmd_bind_vertex_buffers(cmd, 1, &[slot.instances.buffer], &[0]);
-            let push = [frame.size.0, frame.size.1];
+            device.cmd_bind_vertex_buffers(cmd, 1, &[instance_buffer], &[0]);
             device.cmd_push_constants(
                 cmd,
-                self.layout,
+                pipeline_layout,
                 vk::ShaderStageFlags::VERTEX,
                 0,
                 bytemuck::bytes_of(&push),
             );
-        }
+        };
+        begin_pass(cmd);
+        let mut captured = false;
 
         let mut bound_set = vk::DescriptorSet::null();
         let mut bound_scissor = vk::Rect2D {
@@ -602,7 +689,31 @@ impl UiRenderer {
         let mut bound_pipeline = self.pipeline;
         for prepared_draw in &prepared.draws {
             let draw = &frame.cmds[prepared_draw.cmd_index];
+            // The first glass draw needs everything beneath it drawn. End the pass, blur the target so
+            // far, and begin again; cached bindings are stale after that and are re-established. With no
+            // target image there is nothing to copy, so the pass just carries on.
+            if matches!(draw.texture, super::draw::CmdTexture::Backdrop) && !captured {
+                captured = true;
+                if target_image != vk::Image::null() {
+                    unsafe { device.cmd_end_rendering(cmd) };
+                    self.capture_backdrop(slot_index, cmd, target_image, layout, extent);
+                    begin_pass(cmd);
+                    bound_set = vk::DescriptorSet::null();
+                    bound_scissor = vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: i32::MIN,
+                            y: i32::MIN,
+                        },
+                        extent: vk::Extent2D {
+                            width: u32::MAX,
+                            height: u32::MAX,
+                        },
+                    };
+                    bound_pipeline = pipeline;
+                }
+            }
             let set = match &draw.texture {
+                super::draw::CmdTexture::Backdrop => self.backdrop_set(slot_index),
                 super::draw::CmdTexture::White => self.white.sampled_descriptor_set(),
                 super::draw::CmdTexture::AtlasPage(page) => self
                     .atlas
@@ -618,6 +729,10 @@ impl UiRenderer {
             // completes: a caller may drop its frame (and its `Arc`s) the
             // moment `record` returns.
             match &draw.texture {
+                super::draw::CmdTexture::Backdrop => {
+                    let texture = self.backdrop_texture(slot_index);
+                    self.slots[slot_index].retain(&texture);
+                }
                 super::draw::CmdTexture::White => {
                     self.slots[slot_index].retain(&self.white);
                 }
@@ -652,26 +767,29 @@ impl UiRenderer {
                     device.cmd_set_scissor(cmd, 0, &[scissor]);
                     bound_scissor = scissor;
                 }
+                let glass = matches!(draw.texture, super::draw::CmdTexture::Backdrop);
                 match prepared_draw.kind {
                     DrawKind::Indexed { first, count } => {
-                        if bound_pipeline != self.pipeline {
-                            device.cmd_bind_pipeline(
-                                cmd,
-                                vk::PipelineBindPoint::GRAPHICS,
-                                self.pipeline,
-                            );
-                            bound_pipeline = self.pipeline;
+                        let wanted = if glass {
+                            self.backdrop_pipeline
+                        } else {
+                            self.pipeline
+                        };
+                        if bound_pipeline != wanted {
+                            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, wanted);
+                            bound_pipeline = wanted;
                         }
                         device.cmd_draw_indexed(cmd, count, 1, first, 0, 0);
                     }
                     DrawKind::Instanced { first, count } => {
-                        if bound_pipeline != self.instance_pipeline {
-                            device.cmd_bind_pipeline(
-                                cmd,
-                                vk::PipelineBindPoint::GRAPHICS,
-                                self.instance_pipeline,
-                            );
-                            bound_pipeline = self.instance_pipeline;
+                        let wanted = if glass {
+                            self.backdrop_instance_pipeline
+                        } else {
+                            self.instance_pipeline
+                        };
+                        if bound_pipeline != wanted {
+                            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, wanted);
+                            bound_pipeline = wanted;
                         }
                         device.cmd_draw(cmd, 6, count, 0, first);
                     }
@@ -1153,7 +1271,15 @@ impl Drop for UiRenderer {
             let _ = self.ctx.device().device_wait_idle();
             let device = self.ctx.device();
             device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline(self.instance_pipeline, None);
+            if self.backdrop_pipeline != self.pipeline {
+                device.destroy_pipeline(self.backdrop_pipeline, None);
+            }
+            if self.backdrop_instance_pipeline != self.instance_pipeline {
+                device.destroy_pipeline(self.backdrop_instance_pipeline, None);
+            }
             device.destroy_pipeline_layout(self.layout, None);
+            self.blur.destroy(&self.ctx);
             device.destroy_descriptor_set_layout(self.dsl, None);
         }
     }

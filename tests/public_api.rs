@@ -319,3 +319,19 @@ fn app_runner_paths_are_public() {
         "event loop error: boom"
     );
 }
+
+#[test]
+fn backdrop_paths_are_public() {
+    use dream::ui::draw::{CmdTexture, DrawList};
+
+    let mut list = DrawList::new();
+    list.begin((64.0, 64.0));
+    list.backdrop_rounded(
+        dream::ui::Rect::new(4.0, 4.0, 24.0, 24.0),
+        dream::ui::Color::WHITE,
+        6.0,
+    );
+    let frame = list.finish((64.0, 64.0));
+    assert!(matches!(frame.cmds[0].texture, CmdTexture::Backdrop));
+    let _: fn(&mut DrawList, dream::ui::Rect, dream::ui::Color, f32) = DrawList::backdrop_rounded;
+}

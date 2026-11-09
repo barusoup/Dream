@@ -390,9 +390,9 @@ pub(crate) fn scrollbar_rects(
     }
     let track = Rect::new(
         viewport.max().0 - bar.inset - bar.width,
-        viewport.y + 1.0,
+        viewport.y + bar.inset,
         bar.width,
-        viewport.h - 2.0,
+        (viewport.h - bar.inset * 2.0).max(0.0),
     );
     let thumb_h = (viewport.h / content_h.max(1.0) * track.h)
         .max(bar.min_thumb)

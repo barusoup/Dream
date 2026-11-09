@@ -464,8 +464,25 @@ impl Renderer {
                     );
                 }
             }
-            self.ui
-                .record_in_layout(cmd, frame, target_view, target_size, ui, target_layout);
+            // The glass backdrop copies the target, so hand the UI the image behind the view. A
+            // direct frame whose swapchain cannot be blitted from passes null: the capture is skipped
+            // and glass shows its last backdrop.
+            let target_image = if !direct {
+                self.display.image
+            } else if self.swapchain.supports_transfer_src() {
+                swapchain_image
+            } else {
+                vk::Image::null()
+            };
+            self.ui.record_in_layout(
+                cmd,
+                frame,
+                target_image,
+                target_view,
+                target_size,
+                ui,
+                target_layout,
+            );
         }
 
         if !direct {

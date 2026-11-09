@@ -97,9 +97,19 @@ pub struct Swapchain {
     pub views: Vec<vk::ImageView>,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
+    /// Whether the images can be blitted from (`TRANSFER_SRC` usage and a
+    /// format with `BLIT_SRC` optimal tiling). See [`Self::supports_transfer_src`].
+    transfer_src: bool,
 }
 
 impl Swapchain {
+    /// Whether the images can be read by a blit or copy. The UI's frosted-glass
+    /// backdrop copies the frame out of the swapchain image when a frame is
+    /// composed directly into it; without this, that capture is skipped.
+    pub fn supports_transfer_src(&self) -> bool {
+        self.transfer_src
+    }
+
     /// `old` is the outgoing swapchain for this surface; pass
     /// `vk::SwapchainKHR::null()` on first creation. Recreating without handing
     /// the old handle back fails with `ERROR_NATIVE_WINDOW_IN_USE_KHR`.
@@ -153,6 +163,24 @@ impl Swapchain {
             caps.max_image_count
         });
 
+        // Blitting out of the swapchain (the glass backdrop capture) needs
+        // TRANSFER_SRC usage and a format the driver can blit from. Ask for the
+        // usage only when the surface offers it.
+        let blit_format = unsafe {
+            ctx.instance()
+                .get_physical_device_format_properties(ctx.physical_device, format.format)
+        }
+        .optimal_tiling_features
+        .contains(vk::FormatFeatureFlags::BLIT_SRC);
+        let transfer_src = blit_format
+            && caps
+                .supported_usage_flags
+                .contains(vk::ImageUsageFlags::TRANSFER_SRC);
+        let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        if transfer_src {
+            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(ctx.surface)
             .min_image_count(image_count)
@@ -160,7 +188,7 @@ impl Swapchain {
             .image_color_space(format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(usage)
             .pre_transform(caps.current_transform)
             // The compositor decides which alpha modes it honours: take
             // OPAQUE when offered, otherwise the first supported flag.
@@ -216,6 +244,7 @@ impl Swapchain {
             views,
             format: format.format,
             extent,
+            transfer_src,
         }
     }
 }

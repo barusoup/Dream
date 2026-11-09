@@ -166,7 +166,7 @@ impl Response {
 pub struct ScrollbarStyle {
     /// Thumb width in px.
     pub width: f32,
-    /// Gap between the thumb and the view's right edge in px.
+    /// Gap between the thumb and the view's right edge, and its top and bottom edges, in px.
     pub inset: f32,
     /// Shortest the thumb may get, in px.
     pub min_thumb: f32,

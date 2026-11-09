@@ -75,6 +75,13 @@ enum Extra {
     /// White discs on black at fractional centres, checked pixel by pixel
     /// against the analytic anti-aliasing coverage (see `check_circle_edges`).
     CircleEdges,
+    /// Frosted glass over 8 px black/white stripes, captured on the display
+    /// path (capture on, as the harness runs). See `check_glass`.
+    Glass,
+    /// The same glass rendered first for several frames with capture off, so
+    /// it takes the direct (swapchain) path; then one capture-on frame is read
+    /// back and checked like `Glass`.
+    GlassDirect,
     UiOnlyBeforeScene,
     UiOnlyAfterScene,
 }
@@ -131,6 +138,20 @@ const STEPS: &[Step] = &[
         resize_to: None,
         text: "BedFrame OK",
         extra: Some(Extra::CircleEdges),
+    },
+    Step {
+        name: "glass",
+        scale: 1.0,
+        resize_to: None,
+        text: "BedFrame OK",
+        extra: Some(Extra::Glass),
+    },
+    Step {
+        name: "glass-direct",
+        scale: 1.0,
+        resize_to: None,
+        text: "BedFrame OK",
+        extra: Some(Extra::GlassDirect),
     },
     Step {
         name: "new-glyphs",
@@ -878,6 +899,114 @@ fn ink_bounds(
     (min_x != u32::MAX).then_some((min_x, max_x, min_y, max_y))
 }
 
+/// Width of the glass check's black and white bands, in logical px.
+const GLASS_STRIPE: f32 = 8.0;
+/// The glass panel in logical px: x, y, width, height, corner radius.
+const GLASS_PANEL: (f32, f32, f32, f32, f32) = (100.0, 60.0, 200.0, 120.0, 12.0);
+/// Glass frames rendered with capture off before the read-back frame.
+const GLASS_DIRECT_FRAMES: usize = 8;
+
+/// 8 px black and white bands over the whole frame, with one opaque glass
+/// panel drawn over them. The backdrop is everything drawn before the panel.
+fn build_glass_frame(ui: &mut Ui, scale: f32, screen: (f32, f32)) -> UiFrame {
+    ui.set_scale(scale);
+    ui.begin(UiInput::default(), screen);
+    let (width, height) = screen;
+    let bands = (width / GLASS_STRIPE).ceil() as u32;
+    for band in 0..bands {
+        let x = band as f32 * GLASS_STRIPE;
+        let color = if band.is_multiple_of(2) {
+            Color::BLACK
+        } else {
+            Color::WHITE
+        };
+        ui.draw_list_mut()
+            .rect(Rect::new(x, 0.0, GLASS_STRIPE, height), color);
+    }
+    let (x, y, w, h, radius) = GLASS_PANEL;
+    ui.draw_list_mut()
+        .backdrop_rounded(Rect::new(x, y, w, h), Color::WHITE, radius);
+    ui.end()
+}
+
+/// Glass pixel check. Outside the panel each pixel must still be its stripe
+/// colour exactly. Inside, the stripes average away: the spread must be far
+/// below the stripes' own (about 127), and the mean must sit at the midpoint
+/// of black and white. Prints the numbers it measured.
+fn check_glass(pixels: &[u8], width: u32, height: u32, scale: f32, name: &str) {
+    let red = |x: u32, y: u32| pixels[((y * width + x) * 4) as usize];
+    let (x, y, w, h, radius) = GLASS_PANEL;
+    let (px0, py0) = (x * scale, y * scale);
+    let (px1, py1) = ((x + w) * scale, (y + h) * scale);
+    // Stay clear of the rounded corners and the glass's own edge.
+    let inset = radius * scale + 2.0;
+    let stripe_at = |px: u32| -> u8 {
+        let band = (px as f32 / (GLASS_STRIPE * scale)).floor() as u32;
+        if band.is_multiple_of(2) { 0 } else { 255 }
+    };
+
+    let mut outside = Vec::new();
+    let mut mismatches = 0usize;
+    let mut first_bad = None;
+    for py in 0..height {
+        for px in 0..width {
+            let in_panel = (px as f32) >= px0 - 2.0
+                && (px as f32) < px1 + 2.0
+                && (py as f32) >= py0 - 2.0
+                && (py as f32) < py1 + 2.0;
+            if in_panel {
+                continue;
+            }
+            let base = ((py * width + px) * 4) as usize;
+            let rgb = [pixels[base], pixels[base + 1], pixels[base + 2]];
+            let expected = stripe_at(px);
+            if rgb != [expected; 3] {
+                mismatches += 1;
+                first_bad.get_or_insert((px, py, rgb, expected));
+            }
+            outside.push(red(px, py) as f64);
+        }
+    }
+
+    let mut inner = Vec::new();
+    let (ix0, iy0) = ((px0 + inset) as u32, (py0 + inset) as u32);
+    let (ix1, iy1) = ((px1 - inset) as u32, (py1 - inset) as u32);
+    for py in iy0..iy1 {
+        for px in ix0..ix1 {
+            inner.push(red(px, py) as f64);
+        }
+    }
+
+    let stats = |values: &[f64]| -> (f64, f64, f64, f64) {
+        let n = values.len() as f64;
+        let mean = values.iter().sum::<f64>() / n;
+        let var = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+        let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        (mean, var.sqrt(), min, max)
+    };
+    let (out_mean, out_std, _, _) = stats(&outside);
+    let (in_mean, in_std, in_min, in_max) = stats(&inner);
+    println!(
+        "[glass] step={name} outside: n={} mean={out_mean:.2} std={out_std:.2} mismatches={mismatches} inside: n={} mean={in_mean:.2} std={in_std:.2} min={in_min} max={in_max}",
+        outside.len(),
+        inner.len()
+    );
+    if let Some((px, py, rgb, expected)) = first_bad {
+        panic!(
+            "[{name}] outside the glass pixel ({px},{py}) = {rgb:?}, expected stripe {expected}"
+        );
+    }
+    assert!(
+        in_std * 8.0 < out_std,
+        "[{name}] glass spread {in_std:.2} is not far below the stripes' {out_std:.2}"
+    );
+    assert!(
+        (in_mean - 127.5).abs() <= 6.0,
+        "[{name}] glass mean {in_mean:.2} is not at the black/white midpoint 127.5"
+    );
+}
+
 /// Point the swapchain at the window's current size, if it has moved on.
 fn resize_to_window(renderer: &mut Renderer, window: Option<&Window>, label: &str) {
     let Some(window) = window else {
@@ -1292,6 +1421,46 @@ impl Check {
                 ui.recycle_frame(frame);
                 blocking_before = renderer.context().blocking_submissions();
             }
+            Some(Extra::Glass) => {
+                blocking_before = renderer.context().blocking_submissions();
+                let frame = build_glass_frame(ui, step.scale, logical);
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render glass frame",
+                    |_| 0,
+                    &frame,
+                );
+                ui.recycle_frame(frame);
+            }
+            Some(Extra::GlassDirect) => {
+                // Capture off: frames compose straight into the swapchain and
+                // cannot be read back. Render several glass frames that way
+                // (they must not fault), then capture one frame with capture on.
+                renderer.set_frame_capture(false);
+                for _ in 0..GLASS_DIRECT_FRAMES {
+                    let frame = build_glass_frame(ui, step.scale, logical);
+                    render_settled(
+                        renderer,
+                        self.window.as_deref(),
+                        "render direct glass frame",
+                        |_| 0,
+                        &frame,
+                    );
+                    ui.recycle_frame(frame);
+                }
+                renderer.set_frame_capture(true);
+                blocking_before = renderer.context().blocking_submissions();
+                let frame = build_glass_frame(ui, step.scale, logical);
+                render_settled(
+                    renderer,
+                    self.window.as_deref(),
+                    "render glass frame after direct frames",
+                    |_| 0,
+                    &frame,
+                );
+                ui.recycle_frame(frame);
+            }
             Some(Extra::CircleEdges) => {
                 blocking_before = renderer.context().blocking_submissions();
                 let frame = build_circle_frame(ui, step.scale, logical);
@@ -1404,6 +1573,8 @@ impl Check {
                 | Some(Extra::Gallery(_))
                 | Some(Extra::GalleryDevtools)
                 | Some(Extra::CircleEdges)
+                | Some(Extra::Glass)
+                | Some(Extra::GlassDirect)
         );
         let theme = Theme::dark_theme();
         let panel_style = PanelStyle::default();
@@ -1571,6 +1742,9 @@ impl Check {
         }
         match step.extra {
             Some(Extra::CircleEdges) => check_circle_edges(&pixels, width, height, s, step.name),
+            Some(Extra::Glass) | Some(Extra::GlassDirect) => {
+                check_glass(&pixels, width, height, s, step.name)
+            }
             Some(Extra::Primitives) => {
                 // Pixel probes over the paint primitives. Background is
                 // the clear colour sampled from an empty corner.

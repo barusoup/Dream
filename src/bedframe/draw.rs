@@ -75,6 +75,10 @@ pub enum CmdTexture {
     AtlasPage(usize),
     /// A game texture (images, portraits, item icons).
     Custom(Arc<GpuTexture>),
+    /// The frame so far, blurred: everything drawn before the first
+    /// command that uses this is captured and blurred by the renderer, then
+    /// this samples the result. Used for frosted-glass surfaces.
+    Backdrop,
 }
 
 impl std::fmt::Debug for CmdTexture {
@@ -83,6 +87,7 @@ impl std::fmt::Debug for CmdTexture {
             CmdTexture::White => write!(f, "White"),
             CmdTexture::AtlasPage(page) => write!(f, "AtlasPage({page})"),
             CmdTexture::Custom(_) => write!(f, "Custom(..)"),
+            CmdTexture::Backdrop => write!(f, "Backdrop"),
         }
     }
 }
@@ -93,6 +98,7 @@ impl PartialEq for CmdTexture {
             (CmdTexture::White, CmdTexture::White) => true,
             (CmdTexture::AtlasPage(a), CmdTexture::AtlasPage(b)) => a == b,
             (CmdTexture::Custom(a), CmdTexture::Custom(b)) => Arc::ptr_eq(a, b),
+            (CmdTexture::Backdrop, CmdTexture::Backdrop) => true,
             _ => false,
         }
     }
@@ -793,6 +799,25 @@ impl DrawList {
             radius,
             uv,
         );
+    }
+
+    /// Frosted glass: the frame behind `rect`, blurred, tinted by `tint` and
+    /// clipped to a rounded rectangle of `radius`. The renderer captures and
+    /// blurs everything drawn before the first glass command, so anything
+    /// that should sit behind the glass must be drawn first. Corners are
+    /// anti-aliased like [`Self::image_rounded`].
+    pub fn backdrop_rounded(&mut self, rect: Rect, tint: Color, radius: f32) {
+        // The backdrop covers the whole logical frame, so the rect's own
+        // position, over the frame size, is its UV range.
+        let (w, h) = self.size;
+        let (w, h) = (w.max(1.0), h.max(1.0));
+        let uv = (
+            rect.x / w,
+            rect.y / h,
+            (rect.x + rect.w) / w,
+            (rect.y + rect.h) / h,
+        );
+        self.push_shape_image(rect, CmdTexture::Backdrop, tint, radius, uv);
     }
 
     /// Geometry behind [`Self::image_uv_rect`], over any texture so the
@@ -1985,6 +2010,46 @@ mod tests {
         let dv = 0.5 * 0.5 / 10.0;
         assert!((v[0].uv[0] + du).abs() < eps && (v[0].uv[1] + dv).abs() < eps);
         assert!((v[2].uv[0] - (1.0 + du)).abs() < eps && (v[2].uv[1] - (0.5 + dv)).abs() < eps);
+    }
+
+    #[test]
+    fn backdrop_rounded_uses_backdrop_texture_and_screen_uv() {
+        let mut list = DrawList::new();
+        list.begin((100.0, 100.0));
+        list.set_scale(2.0);
+        // A 20x10 glass panel at (10, 20) in a 100x100 logical frame, radius 4.
+        let rect = Rect::new(10.0, 20.0, 20.0, 10.0);
+        list.backdrop_rounded(rect, Color::WHITE, 4.0);
+        let frame = list.finish((100.0, 100.0));
+        // One command, sampling the captured backdrop rather than an atlas or game texture.
+        assert_eq!(frame.cmds.len(), 1, "{:?}", frame.cmds);
+        assert_eq!(frame.cmds[0].texture, CmdTexture::Backdrop);
+        let v = &frame.vertices;
+        // Padded by one physical pixel, so the quad starts at (19, 39) physical.
+        assert_eq!(v[0].pos, [19.0, 39.0]);
+        assert_eq!(v[2].pos, [61.0, 61.0]);
+        // Params keep the unpadded physical size and radius, mode 2 (rounded image).
+        assert_eq!(v[0].params, [40.0, 20.0, 8.0, 2.0]);
+        assert_eq!(v[0].extra, [1.0, 1.0]);
+        // The backdrop spans the whole logical frame, so each corner's UV is its logical position
+        // over the frame size. The padded corners extrapolate past the rect by the pad (0.5 logical).
+        let eps = 1e-6;
+        let pad = 0.5;
+        let uv = |x: f32, y: f32| ((x / 100.0), (y / 100.0));
+        let (x0, y0) = uv(rect.x - pad, rect.y - pad);
+        let (x1, y1) = uv(rect.x + rect.w + pad, rect.y + rect.h + pad);
+        assert!(
+            (v[0].uv[0] - x0).abs() < eps && (v[0].uv[1] - y0).abs() < eps,
+            "{:?}",
+            v[0].uv
+        );
+        assert!(
+            (v[2].uv[0] - x1).abs() < eps && (v[2].uv[1] - y1).abs() < eps,
+            "{:?}",
+            v[2].uv
+        );
+        // Unscaled UVs: the scale changes positions and params, not texture coordinates.
+        assert!((v[0].uv[0] - 0.095).abs() < eps);
     }
 
     #[test]
