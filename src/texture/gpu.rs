@@ -504,6 +504,37 @@ unsafe fn generate_mips(
     height: u32,
     mip_levels: u32,
 ) {
+    // Level 0 was written by the buffer copy. Nothing above orders that write
+    // before the first blit reads it (SYNC-HAZARD-READ-AFTER-WRITE on
+    // vkCmdBlitImage), so make it visible to transfer reads first.
+    if mip_levels > 1 {
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
     let mut src_w = width;
     let mut src_h = height;
     for level in 1..mip_levels {

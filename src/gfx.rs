@@ -184,6 +184,11 @@ pub struct Renderer {
     frame_pool: vk::CommandPool,
     cmd: Vec<vk::CommandBuffer>,
     image_available: Vec<vk::Semaphore>,
+    /// One per SWAPCHAIN IMAGE (indexed by the acquired image index), not per
+    /// frame slot: a presented image's semaphore stays referenced by the
+    /// presentation engine until that image is re-acquired, so reusing one per
+    /// slot violates VUID-vkQueueSubmit-pSignalSemaphores-00067. Rebuilt with
+    /// the swapchain in `Renderer::resize`.
     render_finished: Vec<vk::Semaphore>,
     in_flight: Vec<vk::Fence>,
     /// Serial carried by each slot's fence; confirmed after the wait.

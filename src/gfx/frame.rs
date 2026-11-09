@@ -94,6 +94,8 @@ impl Renderer {
         // This slot's fence signalled its serial; the in-order queue makes
         // every earlier submission complete as well.
         self.ctx.confirm_completed(self.frame_serials[frame]);
+        // Buffers dropped while earlier frames were in flight can go now.
+        self.ctx.collect_retired_buffers();
         self.finish_scene_thumbnail(frame);
         if self.frame_serials[frame] > 0
             && self.scene_recorded[frame]
@@ -192,13 +194,18 @@ impl Renderer {
         let swapchain_image = self.swapchain.images[image_index as usize];
         let swapchain_view = self.swapchain.views[image_index as usize];
         unsafe {
+            // The image was acquired by `image_available`, which this submit
+            // waits on at COLOR_ATTACHMENT_OUTPUT. The transition must be ordered
+            // after that wait, so its source stage has to include that stage;
+            // TOP_OF_PIPE runs before the wait (SYNC-HAZARD-WRITE-AFTER-READ vs
+            // vkAcquireNextImageKHR).
             vulkan::image_barrier(
                 &device,
                 cmd,
                 swapchain_image,
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags::empty(),
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
@@ -509,8 +516,13 @@ impl Renderer {
             }
 
             // --- Present pass (display image -> swapchain) ---
-            let color = attachment(
+            // VUID-vkCmdBeginRendering-pRenderingInfo-09592: the attachment
+            // layout must match the layout the image is actually in. The
+            // swapchain image was moved to COLOR_ATTACHMENT_OPTIMAL above, so
+            // declare that here rather than GENERAL.
+            let color = attachment_in(
                 swapchain_view,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::AttachmentLoadOp::DONT_CARE,
                 [0.0, 0.0, 0.0, 1.0],
             );
@@ -569,7 +581,9 @@ impl Renderer {
 
             let wait_semaphores = [self.image_available[frame]];
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let signal_semaphores = [self.render_finished[frame]];
+            // Keyed by swapchain image, not frame slot: see `Renderer::render_finished`
+            // (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+            let signal_semaphores = [self.render_finished[image_index as usize]];
             let cmds = [cmd];
             let submit = vk::SubmitInfo::default()
                 .wait_semaphores(&wait_semaphores)

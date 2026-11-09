@@ -1158,6 +1158,20 @@ impl UiRenderer {
                             layer_count: 1,
                         }],
                     );
+                    // The partial copy below writes the same page: order it
+                    // after the clear (SYNC-HAZARD-WRITE-AFTER-WRITE).
+                    let order = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[order],
+                        &[],
+                        &[],
+                    );
                 }
                 let region = vk::BufferImageCopy::default()
                     .buffer_offset(buffer_offset)

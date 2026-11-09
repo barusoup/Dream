@@ -23,6 +23,13 @@ use winit::{dpi::PhysicalSize, window::Window};
 /// The swapchain options a renderer with these settings creates. Gamma
 /// blending prefers a UNORM surface so its encoded values reach the screen
 /// without a decode/encode round trip, which keeps it on the direct path.
+/// One binary render-finished semaphore per swapchain image. Presentation keeps
+/// a semaphore referenced until its image is re-acquired, so the semaphore
+/// must be keyed by image, not by frame slot (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+fn new_render_finished(ctx: &GpuContext, image_count: usize) -> Vec<vk::Semaphore> {
+    (0..image_count).map(|_| new_semaphore(ctx)).collect()
+}
+
 fn swapchain_options(
     present_mode: vulkan::PresentMode,
     blend: UiBlend,
@@ -249,7 +256,7 @@ impl Renderer {
         }
         .expect("allocate frame command buffers");
         let image_available = (0..max_frames).map(|_| new_semaphore(&ctx)).collect();
-        let render_finished = (0..max_frames).map(|_| new_semaphore(&ctx)).collect();
+        let render_finished = new_render_finished(&ctx, swapchain.images.len());
         let in_flight = (0..max_frames).map(|_| new_fence(&ctx)).collect();
 
         // Allocate a 1x1 placeholder until a frame actually records 3D scene
@@ -388,6 +395,16 @@ impl Renderer {
             old,
             swapchain_options(self.present_mode, self.ui_blend),
         );
+        // The render-finished semaphores track the swapchain's images, so they
+        // follow it. `quiesce_gpu` above has already waited the device idle,
+        // so nothing still waits on the retired set.
+        let retired = std::mem::replace(
+            &mut self.render_finished,
+            new_render_finished(&self.ctx, self.swapchain.images.len()),
+        );
+        for semaphore in retired {
+            unsafe { self.ctx.device().destroy_semaphore(semaphore, None) };
+        }
         // The surface may clamp or refuse the requested extent — every
         // downstream size derives from the extent actually chosen.
         let actual = self.swapchain.extent;
@@ -548,7 +565,12 @@ impl Renderer {
         if let Some(Ok(token)) = self.acquire.shutdown() {
             self.reclaim_slot(token.slot);
         }
+        // Read the serial before waiting: idle covers every submission made so
+        // far, and a submission another thread makes later must not be confirmed.
+        let submitted = self.ctx.submitted_serial();
         unsafe { self.ctx.device().device_wait_idle() }.expect("wait idle on display change");
+        self.ctx.confirm_completed(submitted);
+        self.ctx.collect_retired_buffers();
     }
 
     /// Give idle memory back: the UI's upload buffers drop to their start-up
