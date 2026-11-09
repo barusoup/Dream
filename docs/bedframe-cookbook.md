@@ -168,3 +168,29 @@ if p.is_present() {
 - Call `presence` every frame for the same key.
 - During exit, `is_interactive()` is false. Disable the widget's controls then.
 - Reduced motion settles immediately.
+
+## Keeping RAM low
+
+A UI that stays still keeps roughly 100 MB of cold driver and loader pages resident. `dream::memory::trim_working_set` returns those pages to the OS. It lowers the working set (the figure Task Manager shows), not committed bytes. The pages are soft-faulted back in cheaply on the next frame.
+
+`dream::memory::IdleTrim` decides when to trim: once after warm-up, and once after each quiet period.
+
+```rust,ignore
+use dream::memory::IdleTrim;
+use std::time::Instant;
+use winit::event_loop::ControlFlow;
+
+// In the app state:
+let mut trim = IdleTrim::new();
+
+// Whenever a frame is built or input arrives:
+trim.activity(Instant::now());
+
+// In `about_to_wait`:
+let now = Instant::now();
+trim.trim_if_due(now);
+match trim.next_deadline() {
+    Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
+    None => event_loop.set_control_flow(ControlFlow::Wait),
+}
+```

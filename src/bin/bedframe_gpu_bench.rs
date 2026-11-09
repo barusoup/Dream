@@ -143,6 +143,39 @@ impl ApplicationHandler for Probe {
             "scene_warm,live_allocator_bytes={},live_allocation_count={},pixel_max_difference_lsb={worst}",
             warm.0, warm.1
         );
+        let released = renderer.release_scene_resources();
+        let freed = renderer.context().gpu_allocation_stats();
+        println!(
+            "scene_released,released={released},live_allocator_bytes={},live_allocation_count={}",
+            freed.0, freed.1
+        );
+        assert!(released, "scene resources were not released");
+        assert!(
+            freed.0 * 10 <= warm.0 * 6,
+            "release freed too little: {} -> {} live allocator bytes",
+            warm.0,
+            freed.0
+        );
+        // The scene is shown again: the targets, upscaler and blit set rebuild
+        // on demand and reproduce the first scene frame.
+        render(&mut renderer, &frame, true);
+        let (rebuilt_pixels, rw, rh) = renderer.capture_rgba8();
+        assert_eq!((w, h), (rw, rh));
+        let rebuilt_worst = scene_pixels
+            .iter()
+            .zip(&rebuilt_pixels)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            rebuilt_worst <= 1,
+            "rebuilt scene output differs from the first scene frame by {rebuilt_worst} LSB"
+        );
+        let rebuilt = renderer.context().gpu_allocation_stats();
+        println!(
+            "scene_rebuilt,live_allocator_bytes={},pixel_max_difference_lsb={rebuilt_worst}",
+            rebuilt.0
+        );
         profile(&mut renderer, &frame, true, "scene_under_opaque_ui");
         profile(&mut renderer, &frame, false, "ui_only_after_scene");
         profile(&mut renderer, &frame, true, "scene_under_opaque_ui_repeat");

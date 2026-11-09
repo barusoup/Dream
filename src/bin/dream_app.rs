@@ -45,6 +45,9 @@ struct Studio {
     /// app's hidden state together with minimisation.
     occluded: bool,
     last_cursor_icon: Option<CursorIcon>,
+    /// Cached monitor refresh rate, so cursor-driven wake-ups do not query
+    /// the display settings on every pass.
+    monitor: MonitorRate,
 }
 
 /// Inter-frame interval and frame-cost samples from `--pace-probe`.
@@ -141,6 +144,7 @@ impl Studio {
             cursor_present: false,
             occluded: false,
             last_cursor_icon: None,
+            monitor: MonitorRate::new(),
         }
     }
 }
@@ -229,6 +233,7 @@ impl ApplicationHandler for Studio {
                 app.refresh_screen();
                 app.dirty = true;
                 self.cursor_present = false;
+                self.monitor.invalidate();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 app.set_scale(scale_factor as f32);
@@ -244,6 +249,7 @@ impl ApplicationHandler for Studio {
                 app.refresh_screen();
                 app.dirty = true;
                 self.cursor_present = false;
+                self.monitor.invalidate();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 // Physical pixels -> logical, exactly once.
@@ -390,6 +396,7 @@ impl ApplicationHandler for Studio {
                     }
                 }
             }
+            WindowEvent::Moved(_) => self.monitor.invalidate(),
             _ => {}
         }
     }
@@ -406,7 +413,8 @@ impl ApplicationHandler for Studio {
             // monitor, changing a monitor's rate or unplugging one is picked
             // up on the next frame rather than at startup.
             app.window_maximized = window.is_maximized();
-            app.pacing.set_display_hz(monitor_hz(window));
+            app.pacing
+                .set_display_hz(self.monitor.get(window, std::time::Instant::now()));
             // A completely hidden window owes no frames: none it builds can
             // be seen. Minimisation is polled here — the platform has no
             // event for it, and Wayland never answers (`None` keeps the
@@ -418,9 +426,21 @@ impl ApplicationHandler for Studio {
         // Schedule only: the frame itself decides. Asking the app whether a
         // frame is due here *and* again inside `tick` would spend the frame
         // twice — the schedule question is a pure query, and `needs_render`
-        // moves the pacing grid when it answers yes.
+        // moves the pacing grid when it answers yes. The wake may also be a
+        // pending memory trim, which runs here rather than in a frame.
         let now = std::time::Instant::now();
-        match app.next_frame_at(now) {
+        // Probe and selfcheck runs skip trims, so they must not wake for one
+        // either: an unclaimed trim deadline would keep the loop redrawing.
+        let maintain = self.pace_probe.is_none() && !self.selfcheck;
+        if maintain {
+            app.idle_maintenance(now);
+        }
+        let wake = if maintain {
+            app.next_wake_at(now)
+        } else {
+            app.next_frame_at(now)
+        };
+        match wake {
             // Due (or overdue): get a frame built now.
             Some(due) if due <= now => {
                 if let Some(window) = &self.window {
@@ -434,6 +454,45 @@ impl ApplicationHandler for Studio {
             // A truly still screen parks until an event arrives (0 Hz).
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
+    }
+}
+
+/// The monitor refresh rate, re-read at most every `MonitorRate::MAX_AGE` or when invalidated (the window moved, resized or changed scale).
+struct MonitorRate {
+    hz: Option<f32>,
+    read_at: Option<std::time::Instant>,
+}
+
+impl MonitorRate {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_millis(500);
+
+    fn new() -> Self {
+        Self {
+            hz: None,
+            read_at: None,
+        }
+    }
+
+    /// Forget the last read so the next `get` re-queries the window.
+    fn invalidate(&mut self) {
+        self.read_at = None;
+    }
+
+    /// True when the rate was never read or the last read is older than `MAX_AGE`.
+    fn stale(&self, now: std::time::Instant) -> bool {
+        match self.read_at {
+            None => true,
+            Some(read_at) => now.duration_since(read_at) > Self::MAX_AGE,
+        }
+    }
+
+    /// The cached rate, re-reading it through `monitor_hz` when stale.
+    fn get(&mut self, window: &Window, now: std::time::Instant) -> Option<f32> {
+        if self.stale(now) {
+            self.hz = monitor_hz(window);
+            self.read_at = Some(now);
+        }
+        self.hz
     }
 }
 
@@ -640,12 +699,25 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::typed_text;
+    use super::{MonitorRate, typed_text};
     use dream::ui::Rect;
     use dream::ui::atlas::AtlasConfig;
     use dream::ui::font::{FontId, Fonts};
     use dream::ui::widgets::{ButtonStyle, Key, KeyFeed, Ui, UiInput};
     use winit::keyboard::{Key as WinitKey, NamedKey};
+
+    #[test]
+    fn monitor_rate_is_stale_until_read_and_after_max_age() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut rate = MonitorRate::new();
+        assert!(rate.stale(t0), "a fresh cache has never been read");
+        rate.read_at = Some(t0);
+        assert!(!rate.stale(t0 + Duration::from_millis(100)));
+        assert!(rate.stale(t0 + Duration::from_millis(600)));
+        rate.invalidate();
+        assert!(rate.stale(t0), "invalidate forgets the last read");
+    }
 
     /// The space bar must read as printable text. winit hands it over as
     /// `Named(NamedKey::Space)` on every platform — never
