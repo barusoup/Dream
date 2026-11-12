@@ -661,6 +661,7 @@ fn half(h: u16) -> f32 {
     }
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn velocity_top_first(mut bytes: Vec<u8>) -> Vec<u8> {
     assert_eq!(bytes.len(), (W * H * 4) as usize);
     // Velocity readback is raw Vulkan row order; depth readback is top-first.
@@ -672,6 +673,17 @@ fn velocity_top_first(mut bytes: Vec<u8>) -> Vec<u8> {
         }
     }
     bytes
+}
+
+fn read_velocity_top_first(bytes: Vec<u8>) -> Vec<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        bytes
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        velocity_top_first(bytes)
+    }
 }
 
 impl Check {
@@ -776,10 +788,10 @@ impl Check {
             Mat4::from_translation(Vec3::new(0.25, 0.0, 0.0)) * Mat4::from_rotation_y(0.1) * n;
         let mut batches = vec![(1, vec![ImpostorInstance::new(curr, prev, 1.0)])];
         self.capture(false, &batches, false);
-        let mesh_v = velocity_top_first(self.renderer.capture_velocity_rg16f().0);
+        let mesh_v = read_velocity_top_first(self.renderer.capture_velocity_rg16f().0);
         let mesh_d = self.renderer.capture_depth_f32().0;
         self.capture(true, &batches, false);
-        let card_v = velocity_top_first(self.renderer.capture_velocity_rg16f().0);
+        let card_v = read_velocity_top_first(self.renderer.capture_velocity_rg16f().0);
         let card_d = self.renderer.capture_depth_f32().0;
         for (name, bytes) in [
             ("mesh-v", &mesh_v),
@@ -821,10 +833,10 @@ impl Check {
         let mean = delta / (2 * count).max(1) as f64;
         batches[0].1[0].misc[0] = 0.5;
         self.capture(true, &batches, false);
-        let fade_v = velocity_top_first(self.renderer.capture_velocity_rg16f().0);
+        let fade_v = read_velocity_top_first(self.renderer.capture_velocity_rg16f().0);
         batches[0].1[0].misc[0] = 0.0;
         self.capture(true, &batches, false);
-        let zero_v = velocity_top_first(self.renderer.capture_velocity_rg16f().0);
+        let zero_v = read_velocity_top_first(self.renderer.capture_velocity_rg16f().0);
         let zero_d = self.renderer.capture_depth_f32().0;
         let zero_clean = zero_v.iter().all(|v| *v == 0)
             && zero_d

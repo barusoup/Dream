@@ -734,6 +734,9 @@ impl ApplicationHandler for Run {
 
         println!("[study] done screenshots={}", out_dir.display());
 
+        #[cfg(target_os = "macos")]
+        renderer.context().wait_idle();
+        #[cfg(not(target_os = "macos"))]
         unsafe {
             renderer.context().device().device_wait_idle().unwrap();
         }

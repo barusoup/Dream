@@ -201,6 +201,9 @@ impl ApplicationHandler for Studio {
                 .set_display_hz(self.window.as_deref().and_then(monitor_hz));
             println!("[selfcheck] pacing: {}", app.pacing.summary());
             app.selfcheck();
+            #[cfg(target_os = "macos")]
+            app.renderer.context().wait_idle();
+            #[cfg(not(target_os = "macos"))]
             unsafe {
                 app.renderer.context().device().device_wait_idle().unwrap();
             }
