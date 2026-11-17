@@ -34,6 +34,9 @@ impl Ui {
         let enabled = !style.disabled;
         self.blur_if_disabled(id, enabled);
         let hovered = enabled && self.hit(rect);
+        if hovered || (enabled && self.active_id == Some(id) && self.input.mouse_down) {
+            self.set_cursor(super::UiCursor::Text);
+        }
         let mut clicked = false;
         // Focus follows the pointer's single capture: overlapping fields
         // cannot both claim the same press.

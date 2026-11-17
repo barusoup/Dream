@@ -65,6 +65,77 @@ pub struct Prepared {
     remap: Vec<u32>,
 }
 
+/// Capacity policy for a repeatedly reused per-frame buffer.
+///
+/// Growth is immediate: a frame's geometry must always fit. Shrinking is
+/// deliberately lazy — a buffer only releases memory after
+/// [`Self::SHRINK_AFTER`] consecutive frames that use less than a quarter of
+/// it, so a panel that opens and closes, or a transient burst of toasts, does
+/// not churn allocations. Capacities round up to powers of two, which both
+/// bounds the waste and keeps an oscillating frame size from reaching the
+/// shrink threshold (see [`Self::resolve`]).
+pub(crate) struct ResizePolicy {
+    capacity: u64,
+    floor: u64,
+    low_frames: u32,
+}
+
+impl ResizePolicy {
+    pub(crate) const SHRINK_HEADROOM: u64 = 4;
+    pub(crate) const SHRINK_AFTER: u32 = 120;
+
+    pub(crate) fn new(capacity: u64) -> Self {
+        let capacity = capacity.max(4);
+        Self {
+            capacity,
+            floor: capacity,
+            low_frames: 0,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    pub(crate) fn reset_to_floor(&mut self) {
+        self.capacity = self.floor;
+        self.low_frames = 0;
+    }
+
+    pub(crate) fn resolve(&mut self, needed: u64) -> Option<u64> {
+        let needed = needed.max(4);
+        if needed > self.capacity {
+            self.capacity = needed.next_power_of_two().max(self.floor);
+            self.low_frames = 0;
+            return Some(self.capacity);
+        }
+        if self.capacity > self.floor
+            && needed.saturating_mul(Self::SHRINK_HEADROOM) < self.capacity
+        {
+            self.low_frames += 1;
+            if self.low_frames >= Self::SHRINK_AFTER {
+                let target = needed.next_power_of_two().max(self.floor);
+                self.capacity = target;
+                self.low_frames = 0;
+                return Some(target);
+            }
+        } else {
+            self.low_frames = 0;
+        }
+        None
+    }
+}
+
+/// Convert one 8-bit sRGB channel to linear light.
+pub fn srgb_to_linear(value: u8) -> f32 {
+    let x = f32::from(value) / 255.0;
+    if x <= 0.04045 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 impl Prepared {
     fn clear(&mut self) {
         self.draws.clear();
@@ -133,7 +204,7 @@ fn convert_quad(vertices: &[UiVertex], verts: [u32; 4]) -> Option<UiInstance> {
     }
     let w = tr[0] - x;
     let h = bl[1] - y;
-    if !(w > 0.0 && h > 0.0) || !same(br[0], x + w) || !same(br[1], y + h) {
+    if w <= 0.0 || h <= 0.0 || !same(br[0], x + w) || !same(br[1], y + h) {
         return None;
     }
     // UV must match the same corner orientation: TL/TL, TR/TR, BR/BR,
@@ -141,7 +212,8 @@ fn convert_quad(vertices: &[UiVertex], verts: [u32; 4]) -> Option<UiInstance> {
     // them on the indexed path instead of re-orienting.
     let (u0, v0) = (v[0].uv[0], v[0].uv[1]);
     let (u1, v1) = (v[2].uv[0], v[2].uv[1]);
-    if !(u1 > u0 && v1 > v0)
+    if u1 <= u0
+        || v1 <= v0
         || !same(v[1].uv[0], u1)
         || !same(v[1].uv[1], v0)
         || !same(v[3].uv[0], u0)

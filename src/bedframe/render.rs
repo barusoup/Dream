@@ -17,84 +17,11 @@ use super::draw::{DrawCmd, UiFrame, UiVertex};
 use crate::gfx::vulkan::{self, GpuContext};
 use crate::texture::{self, GpuTexture, SamplerDesc, TextureFormat};
 use ash::vk;
-use prepare::{DrawKind, Prepared, UiInstance};
+use prepare::{DrawKind, Prepared, ResizePolicy, UiInstance};
 use std::sync::Arc;
 
 pub use super::draw::AtlasUpdate;
-
-/// Capacity policy for a repeatedly reused per-frame buffer.
-///
-/// Growth is immediate: a frame's geometry must always fit. Shrinking is
-/// deliberately lazy — a buffer only releases memory after
-/// [`Self::SHRINK_AFTER`] consecutive frames that use less than a quarter of
-/// it, so a panel that opens and closes, or a transient burst of toasts, does
-/// not churn allocations. Capacities round up to powers of two, which both
-/// bounds the waste and keeps an oscillating frame size from reaching the
-/// shrink threshold (see [`Self::resolve`]).
-struct ResizePolicy {
-    capacity: u64,
-    /// Capacity never drops below the size the buffer was created with, so a
-    /// normal UI frame never triggers a resize after start-up.
-    floor: u64,
-    /// Consecutive frames seen using far less than `capacity`.
-    low_frames: u32,
-}
-
-impl ResizePolicy {
-    /// Only count a frame as under-used when `capacity` exceeds this multiple
-    /// of what the frame needed.
-    const SHRINK_HEADROOM: u64 = 4;
-    /// Under-used frames in a row before memory is released. Counted per slot,
-    /// so a few seconds of idle at 60 Hz with frames in flight.
-    const SHRINK_AFTER: u32 = 120;
-
-    fn new(capacity: u64) -> Self {
-        let capacity = capacity.max(4);
-        Self {
-            capacity,
-            floor: capacity,
-            low_frames: 0,
-        }
-    }
-
-    /// Current capacity in bytes.
-    fn capacity(&self) -> u64 {
-        self.capacity
-    }
-
-    /// Back to the creation size, with the shrink count restarted.
-    fn reset_to_floor(&mut self) {
-        self.capacity = self.floor;
-        self.low_frames = 0;
-    }
-
-    /// Account for a frame needing `needed` bytes and return the new capacity
-    /// when the buffer must be recreated, or `None` to keep the existing one.
-    fn resolve(&mut self, needed: u64) -> Option<u64> {
-        let needed = needed.max(4);
-        if needed > self.capacity {
-            // Round up so a slowly growing frame does not reallocate every
-            // frame, and so capacity is always on the power-of-two grid.
-            self.capacity = needed.next_power_of_two().max(self.floor);
-            self.low_frames = 0;
-            return Some(self.capacity);
-        }
-        if self.capacity > self.floor
-            && needed.saturating_mul(Self::SHRINK_HEADROOM) < self.capacity
-        {
-            self.low_frames += 1;
-            if self.low_frames >= Self::SHRINK_AFTER {
-                let target = needed.next_power_of_two().max(self.floor);
-                self.capacity = target;
-                self.low_frames = 0;
-                return Some(target);
-            }
-        } else {
-            self.low_frames = 0;
-        }
-        None
-    }
-}
+pub use prepare::srgb_to_linear;
 
 struct FrameSlot {
     vertices: vulkan::GpuBuffer,
@@ -1432,17 +1359,6 @@ fn create_ui_pipeline(
             .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
             .map_err(|(_, err)| err)
             .expect("create ui pipeline")[0]
-    }
-}
-
-/// Convert an sRGB colour to linear light — mirrors `ui.wgsl`'s vertex path.
-/// Exposed for tests that check CPU and shader agree.
-pub fn srgb_to_linear(value: u8) -> f32 {
-    let c = value as f32 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
     }
 }
 

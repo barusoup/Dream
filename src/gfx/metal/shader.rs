@@ -200,7 +200,10 @@ fn compile_wgsl_to_msl_opts(
         .entry_points
         .iter()
         .zip(translation_info.entry_point_names.into_iter())
-        .filter_map(|(ep, res)| res.ok().map(|msl_name| (ep.name.clone(), msl_name)))
+        .map(|(ep, res)| match res {
+            Ok(msl_name) => (ep.name.clone(), msl_name),
+            Err(err) => (ep.name.clone(), format!("!ERR:{err:?}")),
+        })
         .collect();
     CompiledMsl {
         source: msl_source,

@@ -32,13 +32,14 @@ mod shader;
 mod thumbnail;
 #[cfg(not(target_os = "macos"))]
 mod timing;
+#[cfg(not(target_os = "macos"))]
 pub mod vulkan;
 
 #[cfg(target_os = "macos")]
 pub(crate) use metal::align_up;
 #[cfg(target_os = "macos")]
 pub use metal::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh};
-pub use present::PresentMode;
+pub use present::{GpuPreference, PresentMode};
 #[cfg(not(target_os = "macos"))]
 pub use vulkan::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh};
 
@@ -61,6 +62,17 @@ pub const SCENE_FORMAT: metal::PixelFormat = metal::PixelFormat::RGBA16Float;
 pub const DEPTH_FORMAT: metal::PixelFormat = metal::PixelFormat::Depth32Float;
 #[cfg(target_os = "macos")]
 pub const VELOCITY_FORMAT: metal::PixelFormat = metal::PixelFormat::RG16Float;
+
+/// Diagnostic counts of the shared texture objects of one [`GpuContext`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextureObjectStats {
+    /// Distinct samplers alive in the shared cache.
+    pub samplers: usize,
+    /// Descriptor pool chunks alive.
+    pub descriptor_pools: usize,
+    /// Textures currently holding descriptor sets (one per texture).
+    pub live_texture_sets: usize,
+}
 
 /// Mirror of the errors the swapchain path can report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

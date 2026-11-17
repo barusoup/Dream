@@ -60,14 +60,12 @@ pub unsafe fn image_barrier_mips(
     }
 }
 
-/// Record an image layout transition with full memory visibility.
+/// Record an image layout transition with full memory visibility across every mip level and array layer.
 ///
 /// # Safety
 /// `cmd` must be recording, `image` must be alive and on `device`, and the
 /// caller must order the barrier correctly around the accesses named by
 /// `src_stage`/`dst_stage`/`src_access`/`dst_access`.
-#[allow(clippy::too_many_arguments)]
-/// Image barrier across every mip level and array layer.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn image_barrier_full(
     device: &ash::Device,

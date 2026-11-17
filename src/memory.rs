@@ -80,7 +80,7 @@ pub struct IdleTrim {
 
 impl IdleTrim {
     /// Default quiet period before an idle trim.
-    pub const DEFAULT_IDLE: Duration = Duration::from_millis(1500);
+    pub const DEFAULT_IDLE: Duration = Duration::from_millis(5000);
     /// Default delay after the first activity before the warm-up trim.
     pub const DEFAULT_WARMUP: Duration = Duration::from_millis(2000);
 
@@ -211,18 +211,45 @@ pub fn resident_bytes() -> u64 {
     }
     #[cfg(target_os = "macos")]
     {
-        // `ps` reports resident bytes directly (KiB); /proc does not exist
-        // on macOS so the Linux path would silently read 0.
-        let pid = std::process::id();
-        let output = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &pid.to_string()])
-            .output()
-            .ok();
-        return output
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .map(|kib| kib * 1024)
-            .unwrap_or(0);
+        #[repr(C)]
+        #[derive(Default)]
+        struct TimeValue {
+            seconds: i32,
+            microseconds: i32,
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct MachTaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: TimeValue,
+            system_time: TimeValue,
+            policy: i32,
+            suspend_count: i32,
+        }
+        const MACH_TASK_BASIC_INFO: u32 = 20;
+        unsafe extern "C" {
+            static mach_task_self_: u32;
+            fn task_info(
+                target_task: u32,
+                flavor: u32,
+                task_info_out: *mut u32,
+                task_info_out_cnt: *mut u32,
+            ) -> i32;
+        }
+        let mut info = MachTaskBasicInfo::default();
+        let mut count =
+            (core::mem::size_of::<MachTaskBasicInfo>() / core::mem::size_of::<u32>()) as u32;
+        let kr = unsafe {
+            task_info(
+                mach_task_self_,
+                MACH_TASK_BASIC_INFO,
+                (&raw mut info).cast::<u32>(),
+                &raw mut count,
+            )
+        };
+        return if kr == 0 { info.resident_size } else { 0 };
     }
     #[cfg(target_os = "linux")]
     {

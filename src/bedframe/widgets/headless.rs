@@ -247,6 +247,9 @@ impl<'a> SliderBehavior<'a> {
     pub fn update(self, ui: &mut Ui, rect: Rect) -> (Response, State) {
         let id = ui.id(self.label);
         let hovered = ui.hit(rect);
+        if hovered || (ui.active_id == Some(id) && ui.input.mouse_down) {
+            ui.set_cursor(super::UiCursor::EwResize);
+        }
         let mut clicked = false;
         // Paint-only replay: register/focus visuals run, but the value,
         // capture state and responses stay owned by the live pass.
@@ -316,6 +319,9 @@ impl<'a> DragBehavior<'a> {
     pub fn update(self, ui: &mut Ui, rect: Rect) -> (Response, State) {
         let id = ui.id(self.label);
         let hovered = ui.hit(rect);
+        if hovered || (ui.active_id == Some(id) && ui.input.mouse_down) {
+            ui.set_cursor(super::UiCursor::EwResize);
+        }
         let mut changed = false;
         // Paint-only replay: no capture, anchor writes or value mutation —
         // the live pass owns interaction state and responses.

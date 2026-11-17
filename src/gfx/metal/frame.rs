@@ -71,7 +71,13 @@ impl Renderer {
     {
         self.scene_sample = None;
         self.phases = FramePhases::default();
-        if self.needs_display() && !self.display_live {
+        let has_backdrop = ui.is_some_and(|f| {
+            f.cmds
+                .iter()
+                .any(|c| matches!(c.texture, crate::ui::draw::CmdTexture::Backdrop))
+        });
+        let direct = !self.needs_display() && !has_backdrop;
+        if !direct && !self.display_live {
             self.ensure_display();
         }
 
@@ -146,7 +152,6 @@ impl Renderer {
             .commandBuffer()
             .expect("create Metal command buffer");
 
-        let direct = !self.needs_display();
         let drawable_tex = drawable.texture();
         let target_size: (u32, u32) = if direct {
             swapchain_extent

@@ -69,16 +69,23 @@ pub(crate) fn scene_region(
 
 pub(crate) fn display_format(swapchain_format: MTLPixelFormat, blend: UiBlend) -> MTLPixelFormat {
     match blend {
-        UiBlend::Gamma => MTLPixelFormat::RGBA8Unorm,
+        UiBlend::Gamma => match swapchain_format {
+            MTLPixelFormat::BGRA8Unorm_sRGB => MTLPixelFormat::BGRA8Unorm,
+            MTLPixelFormat::RGBA8Unorm_sRGB => MTLPixelFormat::RGBA8Unorm,
+            other => other,
+        },
         UiBlend::Linear => swapchain_format,
     }
 }
 
-pub(crate) fn present_fragment_entry(blend: UiBlend, display_fmt: MTLPixelFormat) -> &'static str {
-    match blend {
-        UiBlend::Gamma if super::is_srgb(display_fmt) => "fs_main",
-        UiBlend::Gamma => "fs_gamma",
-        UiBlend::Linear => "fs_main",
+pub(crate) fn present_fragment_entry(
+    blend: UiBlend,
+    swapchain_format: MTLPixelFormat,
+) -> &'static str {
+    if blend == UiBlend::Gamma && super::is_srgb(swapchain_format) {
+        "fs_gamma"
+    } else {
+        "fs_main"
     }
 }
 
@@ -134,6 +141,9 @@ fn get_function(
         .find(|(wgsl, _)| wgsl == entry)
         .map(|(_, msl)| msl.as_str())
         .unwrap_or(entry);
+    if let Some(reason) = msl_name.strip_prefix("!ERR:") {
+        panic!("{label}: {kind} function '{entry}' failed MSL translation: {reason}");
+    }
     lib.newFunctionWithName(&NSString::from_str(msl_name))
         .unwrap_or_else(|| panic!("{label}: missing {kind} function '{entry}' (msl '{msl_name}')"))
 }

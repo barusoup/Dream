@@ -150,6 +150,13 @@ impl Ui {
     pub fn splitter(&mut self, label: &str, rect: Rect, fraction: &mut f32) -> Response {
         let id = self.id(label);
         let hovered = self.hit(rect);
+        if hovered || (self.active_id == Some(id) && self.input.mouse_down) {
+            self.set_cursor(if rect.w >= rect.h {
+                super::UiCursor::EwResize
+            } else {
+                super::UiCursor::NsResize
+            });
+        }
         let mut changed = false;
         if self.input.mouse_pressed && hovered && self.try_capture(id) {
             self.focus_id = Some(id);

@@ -63,5 +63,10 @@ fn main() -> Result<(), RunError> {
         volume: 0.5,
         name: String::new(),
     };
-    run(AppOptions::new("Hello, Dream").size(420.0, 420.0), app)
+    run(
+        AppOptions::new("Hello, Dream")
+            .size(420.0, 420.0)
+            .low_power_gpu(true),
+        app,
+    )
 }

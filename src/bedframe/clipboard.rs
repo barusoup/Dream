@@ -20,91 +20,43 @@ fn fallback_write(text: &str) {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(unexpected_cfgs)]
 mod imp {
-    use objc::runtime::Object;
-    use objc::{class, msg_send, sel, sel_impl};
-
-    struct NsString(*mut Object);
-
-    impl NsString {
-        fn new(text: &str) -> Self {
-            unsafe {
-                let cls = class!(NSString);
-                let obj: *mut Object = msg_send![cls, alloc];
-                let obj: *mut Object = msg_send![obj,
-                    initWithBytes: text.as_ptr() as *const std::ffi::c_void
-                    length: text.len()
-                    encoding: 4usize
-                ];
-                Self(obj)
-            }
-        }
-
-        fn raw(&self) -> *mut Object {
-            self.0
-        }
-    }
-
-    impl Drop for NsString {
-        fn drop(&mut self) {
-            unsafe {
-                if !self.0.is_null() {
-                    let _: () = msg_send![self.0, release];
-                }
-            }
-        }
-    }
-
-    struct Pool(*mut Object);
-
-    impl Pool {
-        fn new() -> Self {
-            unsafe { Self(msg_send![class!(NSAutoreleasePool), new]) }
-        }
-    }
-
-    impl Drop for Pool {
-        fn drop(&mut self) {
-            unsafe {
-                let _: () = msg_send![self.0, drain];
-            }
-        }
-    }
+    use objc2::rc::autoreleasepool;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
 
     pub fn read() -> Option<String> {
-        let _pool = Pool::new();
-        unsafe {
-            let board: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
+        autoreleasepool(|_| unsafe {
+            let board: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
             if board.is_null() {
                 return super::fallback_read();
             }
-            let text: *mut Object =
-                msg_send![board, stringForType: NsString::new("public.utf8-plain-text").raw()];
+            let kind = NSString::from_str("public.utf8-plain-text");
+            let text: *mut AnyObject = msg_send![board, stringForType: &*kind];
             if text.is_null() {
                 return super::fallback_read();
             }
-            let ptr: *const i8 = msg_send![text, UTF8String];
+            let ptr: *const core::ffi::c_char = msg_send![text, UTF8String];
             if ptr.is_null() {
                 return super::fallback_read();
             }
             Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
-        }
+        })
     }
 
     pub fn write(text: &str) {
         super::fallback_write(text);
-        let _pool = Pool::new();
-        unsafe {
-            let board: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
+        autoreleasepool(|_| unsafe {
+            let board: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
             if board.is_null() {
                 return;
             }
             let _cleared: isize = msg_send![board, clearContents];
-            let str_obj = NsString::new(text);
-            let type_obj = NsString::new("public.utf8-plain-text");
-            let _ok: bool = msg_send![board, setString: str_obj.raw() forType: type_obj.raw()];
-        }
+            let str_obj = NSString::from_str(text);
+            let type_obj = NSString::from_str("public.utf8-plain-text");
+            let _ok: bool = msg_send![board, setString: &*str_obj, forType: &*type_obj];
+        });
     }
 }
 

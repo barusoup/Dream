@@ -56,15 +56,17 @@ pub(super) enum AcquireOutcome {
 }
 
 /// Owns the worker thread and the one outstanding request.
+/// The thread starts lazily on the first [`Self::request`] and stays parked
+/// or absent while a window is hidden.
 pub(super) struct AcquireWorker {
-    worker: Worker,
+    worker: Option<Worker>,
     reply: Option<Receiver<Result<Token, SurfaceError>>>,
 }
 
 impl AcquireWorker {
     pub(super) fn new() -> AcquireWorker {
         AcquireWorker {
-            worker: Worker::new("dream-acquire"),
+            worker: None,
             reply: None,
         }
     }
@@ -86,9 +88,12 @@ impl AcquireWorker {
         semaphore: vk::Semaphore,
     ) {
         debug_assert!(!self.has_request(), "one acquire request at a time");
+        let worker = self
+            .worker
+            .get_or_insert_with(|| Worker::new("dream-acquire"));
         let (tx, rx) = mpsc::channel();
-        let shutdown = self.worker.shutdown_token();
-        let posted = self.worker.post(move || {
+        let shutdown = worker.shutdown_token();
+        let posted = worker.post(move || {
             Self::acquire(ctx, swapchain, slot, fence, semaphore, shutdown, tx);
         });
         // A shut-down worker takes no jobs; the caller sees `Lost` and the
@@ -193,15 +198,16 @@ impl AcquireWorker {
     /// semaphore is signalled and must be waited out before that slot can be
     /// acquired again; `None` means the semaphore is untouched.
     pub(super) fn shutdown(&mut self) -> Option<Result<Token, SurfaceError>> {
-        self.worker.shutdown();
+        if let Some(worker) = self.worker.take() {
+            worker.shutdown();
+        }
         let rx = self.reply.take()?;
         rx.try_recv().ok()
     }
 
-    /// Start a fresh thread after a [`Self::shutdown`] (swapchain rebuild).
-    pub(super) fn respawn(&mut self) {
-        self.worker = Worker::new("dream-acquire");
-    }
+    /// Start a fresh thread after a [`Self::shutdown`] (no-op: `request`
+    /// spawns lazily when the next frame actually acquires).
+    pub(super) fn respawn(&mut self) {}
 }
 
 /// Whether a channel wait gave up or lost the sender.

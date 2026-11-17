@@ -501,6 +501,21 @@ pub struct Ui {
     /// through [`Self::set_motion_scale`]; the default is `1.0`, so the
     /// framework asserts no policy of its own.
     motion_scale: f32,
+    /// Cursor shape requested by hovered/active widgets this frame.
+    cursor: UiCursor,
+}
+
+/// Cursor shape requested by BedFrame widgets for the current frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiCursor {
+    #[default]
+    Default,
+    Pointer,
+    Text,
+    EwResize,
+    NsResize,
+    Grab,
+    Grabbing,
 }
 
 /// Shared text metrics for widgets that don't take an explicit style —
@@ -622,6 +637,7 @@ impl Ui {
             focus_rings: false,
             focus_visible: false,
             atlas_epoch: 0,
+            cursor: UiCursor::Default,
         };
         ui.atlas_epoch = ui.cache.epoch();
         ui
@@ -847,6 +863,16 @@ impl Ui {
         self.editing_caret.or(self.focus_rect)
     }
 
+    /// Cursor shape requested by widgets this frame (`UiCursor::Default` if none).
+    pub fn cursor(&self) -> UiCursor {
+        self.cursor
+    }
+
+    /// Request a cursor shape for this frame.
+    pub fn set_cursor(&mut self, cursor: UiCursor) {
+        self.cursor = cursor;
+    }
+
     /// The focused editor reports its caret rect this frame.
     pub(crate) fn note_editing_caret(&mut self, rect: Rect) {
         self.editing_caret = Some(rect);
@@ -917,6 +943,7 @@ impl Ui {
         self.hot_id = None;
         self.blocked = None;
         self.focus_seen = false;
+        self.cursor = UiCursor::Default;
         self.rate_stack.clear();
         self.clip_scopes.clear();
         self.press_consumed = false;

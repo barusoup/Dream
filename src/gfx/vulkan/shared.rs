@@ -37,16 +37,7 @@ struct PoolChunk {
     live: u32,
 }
 
-/// Diagnostic counts of the shared texture objects of one [`GpuContext`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TextureObjectStats {
-    /// Distinct `vk::Sampler`s alive in the shared cache.
-    pub samplers: usize,
-    /// Descriptor pool chunks alive.
-    pub descriptor_pools: usize,
-    /// Textures currently holding descriptor sets (one per texture).
-    pub live_texture_sets: usize,
-}
+pub use crate::gfx::TextureObjectStats;
 
 /// Cache key for a sampler: equal descriptions share one `vk::Sampler`, and
 /// all mip counts above one behave identically.

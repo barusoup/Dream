@@ -44,7 +44,14 @@ impl Renderer {
     /// Build a renderer whose UI blends in [`UiBlend::default()`]
     /// ([`UiBlend::Gamma`], browser-matching).
     pub fn new(window: Arc<Window>, shader_src: &str, settings: Settings) -> Self {
-        Self::new_inner(window, shader_src, None, settings, UiBlend::default())
+        Self::new_inner(
+            window,
+            shader_src,
+            None,
+            settings,
+            UiBlend::default(),
+            crate::gfx::GpuPreference::HighPerformance,
+        )
     }
 
     /// Like [`Self::new`], with the UI pass blending in `blend`'s colour
@@ -58,7 +65,25 @@ impl Renderer {
         settings: Settings,
         blend: UiBlend,
     ) -> Self {
-        Self::new_inner(window, shader_src, None, settings, blend)
+        Self::new_inner(
+            window,
+            shader_src,
+            None,
+            settings,
+            blend,
+            crate::gfx::GpuPreference::HighPerformance,
+        )
+    }
+
+    /// Like [`Self::new_with_ui_blend`], selecting an adapter according to `preference`.
+    pub fn new_with_options(
+        window: Arc<Window>,
+        shader_src: &str,
+        settings: Settings,
+        blend: UiBlend,
+        preference: crate::gfx::GpuPreference,
+    ) -> Self {
+        Self::new_inner(window, shader_src, None, settings, blend, preference)
     }
 
     /// Like [`Self::new`], but additionally compiles `pulling_shader_src` as
@@ -78,6 +103,7 @@ impl Renderer {
             Some(pulling_shader_src),
             settings,
             UiBlend::default(),
+            crate::gfx::GpuPreference::HighPerformance,
         )
     }
 
@@ -87,12 +113,13 @@ impl Renderer {
         pulling_shader_src: Option<&str>,
         settings: Settings,
         ui_blend: UiBlend,
+        preference: crate::gfx::GpuPreference,
     ) -> Self {
         let size = window.inner_size();
         let display_size = (size.width.max(1), size.height.max(1)); // requested
         // The context keeps the window alive until its own teardown destroys
         // the surface: the caller's Arc may drop as soon as `new` returns.
-        let ctx = GpuContext::new_owned(window.clone());
+        let ctx = GpuContext::new_owned_with_preference(window.clone(), preference);
 
         let temporal = matches!(settings.aa, AaMode::Fsr);
         let render_scale = if temporal {

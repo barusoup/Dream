@@ -16,67 +16,21 @@ use crate::texture::{self, GpuTexture, SamplerDesc, TextureFormat};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCompareFunction,
+    MTLBlitCommandEncoder, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCompareFunction,
     MTLDepthStencilState, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineState, MTLScissorRect,
     MTLSize, MTLStoreAction, MTLTexture, MTLVertexDescriptor, MTLVertexFormat,
     MTLVertexStepFunction,
 };
-use prepare::{DrawKind, Prepared, UiInstance};
+use prepare::{DrawKind, Prepared, ResizePolicy, UiInstance};
+use std::collections::HashSet;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 pub use super::draw::AtlasUpdate;
+pub use prepare::srgb_to_linear;
 
 const SHADER: &str = include_str!("ui.wgsl");
-
-struct ResizePolicy {
-    capacity: u64,
-    floor: u64,
-    low_frames: u32,
-}
-
-impl ResizePolicy {
-    const SHRINK_HEADROOM: u64 = 4;
-    const SHRINK_AFTER: u32 = 120;
-
-    fn new(capacity: u64) -> Self {
-        let capacity = capacity.max(4);
-        Self {
-            capacity,
-            floor: capacity,
-            low_frames: 0,
-        }
-    }
-
-    fn reset_to_floor(&mut self) {
-        self.capacity = self.floor;
-        self.low_frames = 0;
-    }
-
-    fn resolve(&mut self, needed: u64) -> Option<u64> {
-        let needed = needed.max(4);
-        if needed > self.capacity {
-            self.capacity = needed.next_power_of_two().max(self.floor);
-            self.low_frames = 0;
-            return Some(self.capacity);
-        }
-        if needed * Self::SHRINK_HEADROOM < self.capacity && self.capacity > self.floor {
-            self.low_frames += 1;
-            if self.low_frames >= Self::SHRINK_AFTER {
-                let target = (needed * 2).next_power_of_two().max(self.floor);
-                if target < self.capacity {
-                    self.capacity = target;
-                    self.low_frames = 0;
-                    return Some(target);
-                }
-            }
-        } else {
-            self.low_frames = 0;
-        }
-        None
-    }
-}
 
 struct FrameSlot {
     vertices: GpuBuffer,
@@ -88,6 +42,17 @@ struct FrameSlot {
     instance_policy: ResizePolicy,
     staging_policy: ResizePolicy,
     retained_textures: Vec<Arc<GpuTexture>>,
+    retained_seen: HashSet<usize>,
+    prepared: Prepared,
+}
+
+impl FrameSlot {
+    fn retain(&mut self, texture: &Arc<GpuTexture>) {
+        let key = Arc::as_ptr(texture) as usize;
+        if self.retained_seen.insert(key) {
+            self.retained_textures.push(Arc::clone(texture));
+        }
+    }
 }
 
 struct PageTex {
@@ -282,9 +247,9 @@ impl UiRenderer {
         let frames = ctx.max_frames_in_flight();
         let slots = (0..frames)
             .map(|_| {
-                let v_cap = 64 * 1024;
-                let i_cap = 32 * 1024;
-                let inst_cap = 32 * 1024;
+                let v_cap = 8 * 1024;
+                let i_cap = 4 * 1024;
+                let inst_cap = 4 * 1024;
                 let st_cap = 64 * 1024;
                 FrameSlot {
                     vertices: ctx.create_host_buffer("ui vertices", v_cap),
@@ -296,6 +261,8 @@ impl UiRenderer {
                     instance_policy: ResizePolicy::new(inst_cap),
                     staging_policy: ResizePolicy::new(st_cap),
                     retained_textures: Vec::new(),
+                    retained_seen: HashSet::new(),
+                    prepared: Prepared::default(),
                 }
             })
             .collect();
@@ -342,15 +309,28 @@ impl UiRenderer {
     }
 
     pub fn trim(&mut self) {
+        for b in &mut self.backdrop {
+            *b = None;
+        }
         for slot in &mut self.slots {
             slot.retained_textures.clear();
+            slot.retained_seen.clear();
             slot.vertex_policy.reset_to_floor();
             slot.index_policy.reset_to_floor();
             slot.instance_policy.reset_to_floor();
             slot.staging_policy.reset_to_floor();
-        }
-        for b in &mut self.backdrop {
-            *b = None;
+            slot.vertices = self
+                .ctx
+                .create_host_buffer("ui vertices", slot.vertex_policy.capacity());
+            slot.indices = self
+                .ctx
+                .create_host_buffer("ui indices", slot.index_policy.capacity());
+            slot.instances = self
+                .ctx
+                .create_host_buffer("ui instances", slot.instance_policy.capacity());
+            slot.staging = self
+                .ctx
+                .create_host_buffer("ui atlas staging", slot.staging_policy.capacity());
         }
     }
 
@@ -363,11 +343,19 @@ impl UiRenderer {
         slot_index: usize,
         clear: bool,
     ) {
+        self.last_draws = 0;
+        self.last_instances = 0;
+        self.last_raw_tris = 0;
+        self.last_vertex_bytes = 0;
+        self.last_index_bytes = 0;
+        self.last_instance_bytes = 0;
+
         let slot_index = slot_index % self.slots.len();
         self.slots[slot_index].retained_textures.clear();
+        self.slots[slot_index].retained_seen.clear();
         self.sync_atlas(cmd, frame, slot_index);
 
-        let mut prepared = Prepared::default();
+        let mut prepared = std::mem::take(&mut self.slots[slot_index].prepared);
         prepare::prepare_into(
             &mut prepared,
             &frame.cmds,
@@ -384,7 +372,6 @@ impl UiRenderer {
         self.last_instance_bytes = inst_bytes.len() as u64;
         self.last_instances = prepared.instances.len() as u64;
         self.last_raw_tris = (prepared.indices.len() / 3) as u64;
-        self.last_draws = prepared.draws.len() as u64;
 
         {
             let slot = &mut self.slots[slot_index];
@@ -396,6 +383,10 @@ impl UiRenderer {
             }
             if let Some(cap) = slot.instance_policy.resolve(inst_bytes.len() as u64) {
                 slot.instances = self.ctx.create_host_buffer("ui instances", cap);
+            }
+            let uploads_due = frame.atlas_snapshot.is_some() || !frame.atlas_updates.is_empty();
+            if !uploads_due && let Some(cap) = slot.staging_policy.resolve(0) {
+                slot.staging = self.ctx.create_host_buffer("ui atlas staging", cap);
             }
             if !v_bytes.is_empty() {
                 slot.vertices.write_bytes(0, v_bytes);
@@ -415,16 +406,22 @@ impl UiRenderer {
                 att.setTexture(Some(target));
                 att.setLoadAction(MTLLoadAction::Clear);
                 att.setStoreAction(MTLStoreAction::Store);
+                att.setClearColor(MTLClearColor {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 1.0,
+                });
                 let enc = cmd
                     .renderCommandEncoderWithDescriptor(&rpd)
                     .expect("ui clear");
                 enc.endEncoding();
             }
+            self.slots[slot_index].prepared = prepared;
             return;
         }
 
-        let screen = [extent.0.max(1) as f32, extent.1.max(1) as f32];
-        let scale = (1.0f32, 1.0f32);
+        let screen = [frame.size.0.max(1.0), frame.size.1.max(1.0)];
         let viewport = make_viewport(extent);
         let full_scissor = MTLScissorRect {
             x: 0,
@@ -436,10 +433,10 @@ impl UiRenderer {
             None
         } else {
             frame.dirty_rect.map(|d| {
-                let x0 = ((d.x * scale.0).floor().max(0.0) as usize).min(extent.0 as usize);
-                let y0 = ((d.y * scale.1).floor().max(0.0) as usize).min(extent.1 as usize);
-                let x1 = (((d.x + d.w) * scale.0).ceil().max(0.0) as usize).min(extent.0 as usize);
-                let y1 = (((d.y + d.h) * scale.1).ceil().max(0.0) as usize).min(extent.1 as usize);
+                let x0 = (d.x.floor().max(0.0) as usize).min(extent.0 as usize);
+                let y0 = (d.y.floor().max(0.0) as usize).min(extent.1 as usize);
+                let x1 = ((d.x + d.w).ceil().max(0.0) as usize).min(extent.0 as usize);
+                let y1 = ((d.y + d.h).ceil().max(0.0) as usize).min(extent.1 as usize);
                 MTLScissorRect {
                     x: x0,
                     y: y0,
@@ -455,11 +452,27 @@ impl UiRenderer {
             att.setTexture(Some(target));
             att.setLoadAction(load);
             att.setStoreAction(MTLStoreAction::Store);
+            if load == MTLLoadAction::Clear {
+                att.setClearColor(MTLClearColor {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 1.0,
+                });
+            }
             let enc = cmd
                 .renderCommandEncoderWithDescriptor(&rpd)
                 .expect("ui render encoder");
             enc.setViewport(viewport);
             enc.setDepthStencilState(Some(&self.depth_stencil));
+            let push_bytes = bytemuck::bytes_of(&screen);
+            unsafe {
+                enc.setVertexBytes_length_atIndex(
+                    NonNull::new_unchecked(push_bytes.as_ptr() as *mut _),
+                    push_bytes.len(),
+                    PUSH_CONSTANT_BUFFER_SLOT as usize,
+                );
+            }
             enc
         };
 
@@ -470,6 +483,10 @@ impl UiRenderer {
         });
         let mut backdrop_captured = false;
         let mut draw_count = 0u64;
+        let mut bound_pipe: Option<usize> = None;
+        let mut bound_tex: Option<usize> = None;
+        let mut bound_vbuf: Option<u8> = None;
+        let mut bound_scissor: Option<MTLScissorRect> = None;
 
         for draw in &prepared.draws {
             let cmd_info = &frame.cmds[draw.cmd_index];
@@ -489,30 +506,37 @@ impl UiRenderer {
                 backdrop::capture_backdrop_pass(&self.ctx, cmd, &self.blur, bd, target);
                 backdrop_captured = true;
                 enc = begin_ui_pass(MTLLoadAction::Load);
+                bound_pipe = None;
+                bound_tex = None;
+                bound_vbuf = None;
+                bound_scissor = None;
             }
 
-            let tex: &GpuTexture = match &cmd_info.texture {
-                CmdTexture::White => &self.white,
+            let tex_arc: Arc<GpuTexture> = match &cmd_info.texture {
+                CmdTexture::White => Arc::clone(&self.white),
                 CmdTexture::AtlasPage(idx) => self
                     .atlas
                     .as_ref()
                     .and_then(|a| a.pages.get(*idx))
                     .and_then(|p| p.as_ref())
-                    .map(|p| p.texture.as_ref())
-                    .unwrap_or(&self.white),
-                CmdTexture::Custom(t) => t.as_ref(),
-                CmdTexture::Backdrop => self.backdrop[slot_index]
-                    .as_ref()
-                    .expect("backdrop captured")
-                    .out
-                    .as_ref(),
+                    .map(|p| Arc::clone(&p.texture))
+                    .unwrap_or_else(|| Arc::clone(&self.white)),
+                CmdTexture::Custom(t) => Arc::clone(t),
+                CmdTexture::Backdrop => Arc::clone(
+                    &self.backdrop[slot_index]
+                        .as_ref()
+                        .expect("backdrop captured")
+                        .out,
+                ),
             };
+            let tex_key = Arc::as_ptr(&tex_arc) as usize;
+            self.slots[slot_index].retain(&tex_arc);
 
             let mut scissor = if let Some(c) = cmd_info.scissor {
-                let x0 = ((c.x * scale.0).floor().max(0.0) as usize).min(extent.0 as usize);
-                let y0 = ((c.y * scale.1).floor().max(0.0) as usize).min(extent.1 as usize);
-                let x1 = (((c.x + c.w) * scale.0).ceil().max(0.0) as usize).min(extent.0 as usize);
-                let y1 = (((c.y + c.h) * scale.1).ceil().max(0.0) as usize).min(extent.1 as usize);
+                let x0 = (c.x.floor().max(0.0) as usize).min(extent.0 as usize);
+                let y0 = (c.y.floor().max(0.0) as usize).min(extent.1 as usize);
+                let x1 = ((c.x + c.w).ceil().max(0.0) as usize).min(extent.0 as usize);
+                let y1 = ((c.y + c.h).ceil().max(0.0) as usize).min(extent.1 as usize);
                 MTLScissorRect {
                     x: x0,
                     y: y0,
@@ -537,7 +561,18 @@ impl UiRenderer {
             if scissor.width == 0 || scissor.height == 0 {
                 continue;
             }
-            enc.setScissorRect(scissor);
+            if bound_scissor != Some(scissor) {
+                enc.setScissorRect(scissor);
+                bound_scissor = Some(scissor);
+            }
+
+            if bound_tex != Some(tex_key) {
+                unsafe {
+                    enc.setFragmentTexture_atIndex(Some(tex_arc.texture()), 0);
+                    enc.setFragmentSamplerState_atIndex(Some(tex_arc.sampler()), 0);
+                }
+                bound_tex = Some(tex_key);
+            }
 
             let slot = &self.slots[slot_index];
             match draw.kind {
@@ -550,21 +585,22 @@ impl UiRenderer {
                     } else {
                         &self.pipeline
                     };
-                    enc.setRenderPipelineState(pipe);
+                    let pipe_key = Retained::as_ptr(pipe) as usize;
+                    if bound_pipe != Some(pipe_key) {
+                        enc.setRenderPipelineState(pipe);
+                        bound_pipe = Some(pipe_key);
+                    }
+                    if bound_vbuf != Some(1) {
+                        unsafe {
+                            enc.setVertexBuffer_offset_atIndex(
+                                Some(&slot.vertices.buffer),
+                                0,
+                                VERTEX_BUFFER_SLOT as usize,
+                            );
+                        }
+                        bound_vbuf = Some(1);
+                    }
                     unsafe {
-                        enc.setVertexBuffer_offset_atIndex(
-                            Some(&slot.vertices.buffer),
-                            0,
-                            VERTEX_BUFFER_SLOT as usize,
-                        );
-                        let push_bytes = bytemuck::bytes_of(&screen);
-                        enc.setVertexBytes_length_atIndex(
-                            NonNull::new_unchecked(push_bytes.as_ptr() as *mut _),
-                            push_bytes.len(),
-                            PUSH_CONSTANT_BUFFER_SLOT as usize,
-                        );
-                        enc.setFragmentTexture_atIndex(Some(tex.texture()), 0);
-                        enc.setFragmentSamplerState_atIndex(Some(tex.sampler()), 0);
                         enc.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
                             MTLPrimitiveType::Triangle,
                             index_count as usize,
@@ -583,21 +619,22 @@ impl UiRenderer {
                     } else {
                         &self.instance_pipeline
                     };
-                    enc.setRenderPipelineState(pipe);
+                    let pipe_key = Retained::as_ptr(pipe) as usize;
+                    if bound_pipe != Some(pipe_key) {
+                        enc.setRenderPipelineState(pipe);
+                        bound_pipe = Some(pipe_key);
+                    }
+                    if bound_vbuf != Some(2) {
+                        unsafe {
+                            enc.setVertexBuffer_offset_atIndex(
+                                Some(&slot.instances.buffer),
+                                0,
+                                VERTEX_BUFFER_SLOT as usize,
+                            );
+                        }
+                        bound_vbuf = Some(2);
+                    }
                     unsafe {
-                        enc.setVertexBuffer_offset_atIndex(
-                            Some(&slot.instances.buffer),
-                            0,
-                            VERTEX_BUFFER_SLOT as usize,
-                        );
-                        let push_bytes = bytemuck::bytes_of(&screen);
-                        enc.setVertexBytes_length_atIndex(
-                            NonNull::new_unchecked(push_bytes.as_ptr() as *mut _),
-                            push_bytes.len(),
-                            PUSH_CONSTANT_BUFFER_SLOT as usize,
-                        );
-                        enc.setFragmentTexture_atIndex(Some(tex.texture()), 0);
-                        enc.setFragmentSamplerState_atIndex(Some(tex.sampler()), 0);
                         enc.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                             MTLPrimitiveType::Triangle,
                             0,
@@ -612,7 +649,9 @@ impl UiRenderer {
         }
 
         enc.endEncoding();
-        self.draws = draw_count;
+        self.slots[slot_index].prepared = prepared;
+        self.draws += draw_count;
+        self.last_draws = draw_count;
     }
 
     fn sync_atlas(
@@ -674,6 +713,10 @@ impl UiRenderer {
                 plan.push(p);
             }
             if total_bytes == 0 {
+                let slot = &mut self.slots[slot_index];
+                if let Some(cap) = slot.staging_policy.resolve(0) {
+                    slot.staging = self.ctx.create_host_buffer("ui atlas staging", cap);
+                }
                 return;
             }
             let slot = &mut self.slots[slot_index];
@@ -727,15 +770,16 @@ impl UiRenderer {
                 });
                 let row_bytes = rect.width as usize * bpp;
                 let total_rect_bytes = row_bytes * rect.height as usize;
-                let mut tmp = vec![0u8; total_rect_bytes];
                 let stride = snapshot.page_size as usize * bpp;
-                for row in 0..rect.height as usize {
-                    let src_off = (rect.y as usize + row) * stride + rect.x as usize * bpp;
-                    let dst_off = row * row_bytes;
-                    tmp[dst_off..dst_off + row_bytes]
-                        .copy_from_slice(&page.pixels[src_off..src_off + row_bytes]);
+                if let Some(mapped) = slot.staging.mapped_mut() {
+                    let base = offset as usize;
+                    for row in 0..rect.height as usize {
+                        let src_off = (rect.y as usize + row) * stride + rect.x as usize * bpp;
+                        let dst_off = base + row * row_bytes;
+                        mapped[dst_off..dst_off + row_bytes]
+                            .copy_from_slice(&page.pixels[src_off..src_off + row_bytes]);
+                    }
                 }
-                slot.staging.write_bytes(offset, &tmp);
                 unsafe {
                     blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                         &slot.staging.buffer,
@@ -868,14 +912,5 @@ impl UiRenderer {
 
     pub fn last_prepared_counts(&self) -> (u64, u64, u64) {
         (self.last_instances, self.last_raw_tris, self.last_draws)
-    }
-}
-
-pub fn srgb_to_linear(value: u8) -> f32 {
-    let s = value as f32 / 255.0;
-    if s <= 0.04045 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
     }
 }

@@ -164,6 +164,10 @@ impl GpuContext {
         &self.layer
     }
 
+    pub(crate) fn window(&self) -> Option<&Window> {
+        self._window.as_deref()
+    }
+
     pub fn has_unified_memory(&self) -> bool {
         self.has_unified_memory
     }
@@ -441,8 +445,8 @@ impl GpuContext {
         self.completed_serial.load(Ordering::Acquire)
     }
 
-    pub fn texture_object_stats(&self) -> super::vulkan::TextureObjectStats {
-        super::vulkan::TextureObjectStats {
+    pub fn texture_object_stats(&self) -> super::TextureObjectStats {
+        super::TextureObjectStats {
             samplers: self.shared_samplers.lock().unwrap().len(),
             descriptor_pools: 0,
             live_texture_sets: self.live_textures.load(Ordering::Relaxed),
@@ -612,7 +616,7 @@ fn attach_layer_to_window(window: &Window, layer: &CAMetalLayer) {
             unsafe {
                 let view = ns_view.as_ptr();
                 let _: () = msg_send![view, setWantsLayer: true];
-                let layer_ptr: *const CAMetalLayer = Retained::as_ptr(&Retained::from(layer));
+                let layer_ptr: *const CAMetalLayer = layer;
                 let _: () = msg_send![view, setLayer: layer_ptr];
             }
         }

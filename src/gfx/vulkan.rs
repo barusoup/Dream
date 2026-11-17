@@ -21,6 +21,7 @@ mod shared;
 mod submission;
 mod swapchain;
 
+pub use crate::gfx::present::GpuPreference;
 pub use barriers::{
     buffer_barrier, image_barrier, image_barrier_full, image_barrier_mips, is_depth, is_srgb,
 };
@@ -127,20 +128,30 @@ impl GpuContext {
     /// surfaces) have been dropped; use [`Self::new_owned`] to hand that
     /// lifetime over instead.
     pub fn new(window: &Window) -> Arc<Self> {
-        unsafe { Self::new_unchecked(window) }
+        Self::new_with_preference(window, GpuPreference::HighPerformance)
+    }
+
+    /// Create a context on `window` using the given [`GpuPreference`].
+    pub fn new_with_preference(window: &Window, preference: GpuPreference) -> Arc<Self> {
+        unsafe { Self::new_unchecked(window, preference) }
     }
 
     /// `new` for callers handing the window over: the context keeps the
     /// handle alive until its own `Drop` has destroyed the surface built on
     /// it, so resources can't outlive the native window.
     pub fn new_owned(window: Arc<Window>) -> Arc<Self> {
-        let mut ctx = Self::new(&window);
+        Self::new_owned_with_preference(window, GpuPreference::HighPerformance)
+    }
+
+    /// Like [`Self::new_owned`], selecting an adapter according to `preference`.
+    pub fn new_owned_with_preference(window: Arc<Window>, preference: GpuPreference) -> Arc<Self> {
+        let mut ctx = Self::new_with_preference(&window, preference);
         // The fresh Arc is uniquely owned, so the field can be attached here.
         Arc::get_mut(&mut ctx).expect("fresh context")._window = Some(window);
         ctx
     }
 
-    unsafe fn new_unchecked(window: &Window) -> Arc<Self> {
+    unsafe fn new_unchecked(window: &Window, preference: GpuPreference) -> Arc<Self> {
         let (entry, loader_note) = load_vulkan_entry();
         eprintln!("Vulkan loader: {loader_note}");
 
@@ -193,7 +204,7 @@ impl GpuContext {
         let surface_loader = khr::surface::Instance::new(&entry, &instance);
 
         let (physical_device, queue_family, portability_subset) =
-            unsafe { pick_physical_device(&instance, &surface_loader, surface) };
+            unsafe { pick_physical_device(&instance, &surface_loader, surface, preference) };
 
         let mut device_ext_names = vec![c"VK_KHR_swapchain".as_ptr()];
         // Required on MoltenVK: the subset extension gates the non-portable
@@ -518,6 +529,7 @@ unsafe fn pick_physical_device(
     instance: &Instance,
     surface_loader: &khr::surface::Instance,
     surface: vk::SurfaceKHR,
+    preference: GpuPreference,
 ) -> (vk::PhysicalDevice, u32, bool) {
     let devices = unsafe { instance.enumerate_physical_devices() }.expect("enumerate GPUs");
     let mut rejected = Vec::new();
@@ -591,9 +603,14 @@ unsafe fn pick_physical_device(
                 .unwrap_or(false)
         };
 
-        let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
+        let preferred = match preference {
+            GpuPreference::HighPerformance => {
+                props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+            }
+            GpuPreference::LowPower => props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
+        };
         let candidate = (physical_device, family, portability_subset);
-        if discrete {
+        if preferred {
             for why in &rejected {
                 eprintln!("GPU candidate rejected: {why}");
             }

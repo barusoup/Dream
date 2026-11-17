@@ -151,6 +151,75 @@ impl UiFrame {
         self.cmds.is_empty()
     }
 
+    /// Compact content fingerprint of the frame's geometry, commands, target
+    /// size, and atlas snapshot revisions, used by app runners to skip
+    /// redundant GPU presentations when an input event (e.g. `CursorMoved`)
+    /// leaves the visual frame unchanged.
+    pub(crate) fn content_signature(&self) -> Option<(u64, u64, usize, usize, usize)> {
+        if !self.atlas_updates.is_empty() {
+            return None;
+        }
+        let mut h1 = 0xcbf2_9ce4_8422_2325u64;
+        let mut h2 = 0x9e37_79b9_7f4a_7c15u64;
+        let mix = |h1: &mut u64, h2: &mut u64, v: u64| {
+            *h1 = (*h1 ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+            *h2 = h2
+                .rotate_left(13)
+                .wrapping_add(v)
+                .wrapping_mul(0xff51_afd7_ed55_8ccd);
+        };
+        mix(&mut h1, &mut h2, u64::from(self.size.0.to_bits()));
+        mix(&mut h1, &mut h2, u64::from(self.size.1.to_bits()));
+        if let Some(d) = self.dirty_rect {
+            mix(&mut h1, &mut h2, 1);
+            mix(&mut h1, &mut h2, u64::from(d.x.to_bits()));
+            mix(&mut h1, &mut h2, u64::from(d.y.to_bits()));
+            mix(&mut h1, &mut h2, u64::from(d.w.to_bits()));
+            mix(&mut h1, &mut h2, u64::from(d.h.to_bits()));
+        }
+        if let Some(snap) = &self.atlas_snapshot {
+            mix(&mut h1, &mut h2, snap.atlas_id);
+            mix(&mut h1, &mut h2, snap.epoch);
+            for p in &snap.pages {
+                mix(&mut h1, &mut h2, p.revision);
+            }
+        }
+        for cmd in &self.cmds {
+            match &cmd.texture {
+                CmdTexture::White => mix(&mut h1, &mut h2, 1),
+                CmdTexture::AtlasPage(p) => mix(&mut h1, &mut h2, 2 + *p as u64),
+                CmdTexture::Custom(t) => mix(&mut h1, &mut h2, Arc::as_ptr(t) as usize as u64),
+                CmdTexture::Backdrop => mix(&mut h1, &mut h2, 3),
+            }
+            if let Some(s) = cmd.scissor {
+                mix(&mut h1, &mut h2, u64::from(s.x.to_bits()));
+                mix(&mut h1, &mut h2, u64::from(s.y.to_bits()));
+                mix(&mut h1, &mut h2, u64::from(s.w.to_bits()));
+                mix(&mut h1, &mut h2, u64::from(s.h.to_bits()));
+            }
+            mix(&mut h1, &mut h2, u64::from(cmd.first_index));
+            mix(&mut h1, &mut h2, u64::from(cmd.index_count));
+            mix(&mut h1, &mut h2, cmd.layer as i64 as u64);
+        }
+        for chunk in bytemuck::cast_slice::<UiVertex, u8>(&self.vertices).chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            mix(&mut h1, &mut h2, u64::from_le_bytes(buf));
+        }
+        for chunk in bytemuck::cast_slice::<u32, u8>(&self.indices).chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            mix(&mut h1, &mut h2, u64::from_le_bytes(buf));
+        }
+        Some((
+            h1,
+            h2,
+            self.vertices.len(),
+            self.indices.len(),
+            self.cmds.len(),
+        ))
+    }
+
     /// Restricts rendering to `rect` (in UI pixel coordinates) when
     /// updating a retained UI target.
     pub fn with_dirty_rect(mut self, rect: Rect) -> Self {

@@ -111,6 +111,16 @@ impl Renderer {
         Self::new_inner(window, shader_src, None, settings, blend)
     }
 
+    pub fn new_with_options(
+        window: Arc<Window>,
+        shader_src: &str,
+        settings: Settings,
+        blend: UiBlend,
+        _preference: crate::gfx::GpuPreference,
+    ) -> Self {
+        Self::new_inner(window, shader_src, None, settings, blend)
+    }
+
     pub fn new_with_pulling(
         window: Arc<Window>,
         shader_src: &str,
@@ -235,7 +245,7 @@ impl Renderer {
             .texture(0, 0, 0)
             .sampler(0, 1, 0)
             .push_constants(PUSH_CONSTANT_BUFFER_SLOT);
-        let present_fs = present_fragment_entry(ui_blend, display_fmt);
+        let present_fs = present_fragment_entry(ui_blend, swapchain.format);
         let present_pipeline = create_render_pipeline(
             &ctx,
             "present pipeline",
@@ -353,6 +363,11 @@ impl Renderer {
             return;
         }
         self.ctx.wait_idle();
+        if let Some(window) = self.ctx.window() {
+            self.ctx
+                .layer()
+                .setContentsScale(window.scale_factor().max(1.0));
+        }
         self.swapchain.resize(&self.ctx, size.width, size.height);
         self.display_size = (self.swapchain.width, self.swapchain.height);
         self.render_size = scaled_size(self.display_size, self.render_scale);
@@ -441,7 +456,6 @@ impl Renderer {
         self.ctx.wait_idle();
         self.ui.trim();
         self.ctx.collect_retired_buffers();
-        crate::memory::trim_working_set();
     }
 
     pub fn set_ui_instancing(&mut self, enabled: bool) {
