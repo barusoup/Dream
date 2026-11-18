@@ -73,6 +73,12 @@ pub struct GpuContext {
     /// must match queue order. Raw `queue_submit`/`queue_present` calls
     /// outside `submit_tracked`/`present_tracked` must hold this lock.
     pub queue_lock: Mutex<()>,
+    /// `depthClamp` was enabled on the device: shadow casters beyond a light
+    /// box's near plane still rasterise (see [`Self::depth_clamp`]).
+    depth_clamp: bool,
+    /// Depth format of the sun shadow map: `D16_UNORM` when the device can
+    /// render, sample and linearly filter it, else `D32_SFLOAT`.
+    shadow_depth_format: vk::Format,
     /// Guards `transient_pool`: command-buffer alloc/reset/free on a shared
     /// pool is not externally synchronized in Vulkan.
     transient_lock: Mutex<()>,
@@ -93,6 +99,59 @@ pub struct GpuContext {
     /// once `completed_serial` reaches the serial recorded at drop; see
     /// [`GpuContext::retire_buffer`].
     retired_buffers: Mutex<Vec<RetiredBuffer>>,
+    /// Hardware ray tracing (acceleration structures and ray queries), present
+    /// only when the adapter supports every required extension and feature and
+    /// they were enabled at device creation. See [`RtDevice`].
+    rt: Option<RtDevice>,
+}
+
+/// Loader and limits of the ray-tracing tier, created only when the device
+/// supports it. Everything else in the engine works without it.
+pub(crate) struct RtDevice {
+    /// `VK_KHR_acceleration_structure` entry points.
+    pub(crate) accel: khr::acceleration_structure::Device,
+    /// `minAccelerationStructureScratchOffsetAlignment`.
+    pub(crate) scratch_alignment: u64,
+}
+
+/// Ray-tracing extensions, all required together.
+const RT_DEVICE_EXTENSIONS: [&CStr; 5] = [
+    c"VK_KHR_acceleration_structure",
+    c"VK_KHR_ray_query",
+    c"VK_KHR_deferred_host_operations",
+    c"VK_KHR_ray_tracing_position_fetch",
+    c"VK_KHR_buffer_device_address",
+];
+
+/// Whether `physical_device` exposes every ray-tracing extension and the four
+/// features the tier uses (acceleration structures, ray queries, position
+/// fetch, buffer device addresses).
+fn ray_tracing_available(instance: &Instance, physical_device: vk::PhysicalDevice) -> bool {
+    let Ok(exts) = (unsafe { instance.enumerate_device_extension_properties(physical_device) })
+    else {
+        return false;
+    };
+    let has_ext = |want: &CStr| {
+        exts.iter()
+            .any(|e| e.extension_name_as_c_str().is_ok_and(|name| name == want))
+    };
+    if !RT_DEVICE_EXTENSIONS.iter().all(|want| has_ext(want)) {
+        return false;
+    }
+    let mut accel = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+    let mut ray_query = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+    let mut position = vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default();
+    let mut vk12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut accel)
+        .push_next(&mut ray_query)
+        .push_next(&mut position)
+        .push_next(&mut vk12);
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+    accel.acceleration_structure == vk::TRUE
+        && ray_query.ray_query == vk::TRUE
+        && position.ray_tracing_position_fetch == vk::TRUE
+        && vk12.buffer_device_address == vk::TRUE
 }
 
 /// A dropped buffer waiting for the submissions that may reference it.
@@ -128,10 +187,10 @@ impl GpuContext {
     /// surfaces) have been dropped; use [`Self::new_owned`] to hand that
     /// lifetime over instead.
     pub fn new(window: &Window) -> Arc<Self> {
-        Self::new_with_preference(window, GpuPreference::HighPerformance)
+        Self::new_with_preference(window, GpuPreference::default())
     }
 
-    /// Create a context on `window` using the given [`GpuPreference`].
+    /// Create a context on `window` with an explicit [`GpuPreference`].
     pub fn new_with_preference(window: &Window, preference: GpuPreference) -> Arc<Self> {
         unsafe { Self::new_unchecked(window, preference) }
     }
@@ -140,10 +199,10 @@ impl GpuContext {
     /// handle alive until its own `Drop` has destroyed the surface built on
     /// it, so resources can't outlive the native window.
     pub fn new_owned(window: Arc<Window>) -> Arc<Self> {
-        Self::new_owned_with_preference(window, GpuPreference::HighPerformance)
+        Self::new_owned_with_preference(window, GpuPreference::default())
     }
 
-    /// Like [`Self::new_owned`], selecting an adapter according to `preference`.
+    /// [`Self::new_owned`] with an explicit [`GpuPreference`].
     pub fn new_owned_with_preference(window: Arc<Window>, preference: GpuPreference) -> Arc<Self> {
         let mut ctx = Self::new_with_preference(&window, preference);
         // The fresh Arc is uniquely owned, so the field can be attached here.
@@ -212,6 +271,11 @@ impl GpuContext {
         if portability_subset {
             device_ext_names.push(c"VK_KHR_portability_subset".as_ptr());
         }
+        // The ray-tracing tier is enabled only when the adapter has all of it.
+        let rt_available = ray_tracing_available(&instance, physical_device);
+        if rt_available {
+            device_ext_names.extend(RT_DEVICE_EXTENSIONS.iter().map(|name| name.as_ptr()));
+        }
         let priorities = [1.0_f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
@@ -228,30 +292,70 @@ impl GpuContext {
             // state per attachment. Without this feature those pipelines are
             // invalid to create; pick_physical_device already rejects
             // adapters that lack it.
-            .independent_blend(true);
+            .independent_blend(true)
+            // Shadow casters can extend past their light box's near plane;
+            // clamping keeps them in the map instead of clipping them away.
+            .depth_clamp(supported_features.depth_clamp == vk::TRUE);
 
         // Dynamic rendering is required from Vulkan 1.3 core — device
         // selection already rejected anything that cannot provide it.
         let mut features_13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
-        let device_info = vk::DeviceCreateInfo::default()
+        let mut features_12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut rt_accel = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+            .acceleration_structure(true);
+        let mut rt_query = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+        let mut rt_position = vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
+            .ray_tracing_position_fetch(true);
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&device_ext_names)
             .enabled_features(&base_features)
             .push_next(&mut features_13);
+        if rt_available {
+            features_12 = features_12.buffer_device_address(true);
+            device_info = device_info
+                .push_next(&mut features_12)
+                .push_next(&mut rt_accel)
+                .push_next(&mut rt_query)
+                .push_next(&mut rt_position);
+        }
 
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .expect("create logical device");
+        let device_depth_clamp = supported_features.depth_clamp == vk::TRUE;
+        let shadow_format = pick_shadow_format(&instance, physical_device);
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
+        let rt = rt_available.then(|| {
+            let accel = khr::acceleration_structure::Device::new(&instance, &device);
+            let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut as_props);
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+            RtDevice {
+                accel,
+                scratch_alignment: as_props.min_acceleration_structure_scratch_offset_alignment
+                    as u64,
+            }
+        });
+        eprintln!(
+            "Vulkan ray tracing: {}",
+            if rt.is_some() {
+                "available"
+            } else {
+                "not available"
+            }
+        );
 
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
             device: device.clone(),
             physical_device,
             debug_settings: Default::default(),
-            buffer_device_address: false,
+            // Acceleration-structure inputs and storage need device addresses.
+            buffer_device_address: rt_available,
             allocation_sizes: gpu_allocator::AllocationSizes::new(8 * 1024 * 1024, 2 * 1024 * 1024),
         })
         .expect("create GPU allocator");
@@ -297,6 +401,8 @@ impl GpuContext {
             completed_serial: AtomicU64::new(0),
             blocking_submissions: AtomicU64::new(0),
             queue_lock: Mutex::new(()),
+            depth_clamp: device_depth_clamp,
+            shadow_depth_format: shadow_format,
             transient_lock: Mutex::new(()),
             async_ring: Mutex::new(AsyncRing::default()),
             queue_flags: family_props.queue_flags,
@@ -304,6 +410,7 @@ impl GpuContext {
             max_storage_buffer_range: limits.max_storage_buffer_range,
             shared_textures: Default::default(),
             retired_buffers: Mutex::new(Vec::new()),
+            rt,
         });
         ctx.print_adapter();
         ctx
@@ -392,8 +499,41 @@ impl GpuContext {
         &self.surface_loader
     }
 
+    /// Whether `depthClamp` was enabled on the device.
+    pub(crate) fn depth_clamp(&self) -> bool {
+        self.depth_clamp
+    }
+
+    /// Depth format used by sun shadow maps; see the field docs.
+    pub(crate) fn shadow_depth_format(&self) -> vk::Format {
+        self.shadow_depth_format
+    }
+
     pub fn max_frames_in_flight(&self) -> usize {
         MAX_FRAMES_IN_FLIGHT
+    }
+
+    /// Whether the device supports the hardware ray-tracing tier (acceleration
+    /// structures and ray queries), and it was enabled at device creation.
+    pub fn ray_tracing_supported(&self) -> bool {
+        self.rt.is_some()
+    }
+
+    /// Ray-tracing entry points and limits, when the tier is supported.
+    pub(crate) fn rt_device(&self) -> Option<&RtDevice> {
+        self.rt.as_ref()
+    }
+
+    /// Extra usage for vertex and index buffers that acceleration structures
+    /// are built from: empty when the device has no ray tracing, so existing
+    /// buffers are unchanged there.
+    pub fn rt_geometry_usage(&self) -> vk::BufferUsageFlags {
+        if self.rt.is_some() {
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+        } else {
+            vk::BufferUsageFlags::empty()
+        }
     }
 
     pub fn create_shader_module(&self, spv: &[u32], label: &str) -> vk::ShaderModule {
@@ -582,7 +722,7 @@ unsafe fn pick_physical_device(
             continue;
         };
         // The scene pass needs per-attachment blend state: colour blends for
-        // LoD crossfades while the velocity attachment must stay unblended.
+        // blended materials while the velocity attachment must stay unblended.
         let features = unsafe { instance.get_physical_device_features(physical_device) };
         if features.independent_blend != vk::TRUE {
             rejected.push(format!("{name}: no independentBlend"));
@@ -656,6 +796,22 @@ impl GpuImage {
 /// Find a memory type index for a resource. Retained for future explicit
 /// allocations; gpu-allocator currently picks types on our behalf.
 #[allow(dead_code)]
+/// `D16_UNORM` when the device can render, sample and linearly filter it (the
+/// shadow comparison sampler needs the last); `D32_SFLOAT` otherwise.
+fn pick_shadow_format(instance: &Instance, physical_device: vk::PhysicalDevice) -> vk::Format {
+    let need = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+    let props = unsafe {
+        instance.get_physical_device_format_properties(physical_device, vk::Format::D16_UNORM)
+    };
+    if props.optimal_tiling_features.contains(need) {
+        vk::Format::D16_UNORM
+    } else {
+        vk::Format::D32_SFLOAT
+    }
+}
+
 pub fn find_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     type_filter: u32,

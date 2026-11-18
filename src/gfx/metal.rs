@@ -445,6 +445,10 @@ impl GpuContext {
         self.completed_serial.load(Ordering::Acquire)
     }
 
+    pub fn ray_tracing_supported(&self) -> bool {
+        false
+    }
+
     pub fn texture_object_stats(&self) -> super::TextureObjectStats {
         super::TextureObjectStats {
             samplers: self.shared_samplers.lock().unwrap().len(),

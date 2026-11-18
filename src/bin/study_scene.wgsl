@@ -1,5 +1,6 @@
 // Minimal scene shader for dream_study: engine-contract camera block at
-// set 0 (jittered render + unjittered motion pair), colour + velocity out.
+// set 0 (jittered render + unjittered motion pair), colour + velocity +
+// surface (zero) out.
 
 struct Camera {
     view_projection: mat4x4<f32>,
@@ -20,6 +21,7 @@ struct VertexOutput {
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) velocity: vec2<f32>,
+    @location(2) surface: vec4<f32>,
 };
 
 fn screen_uv(ndc: vec2<f32>) -> vec2<f32> {
@@ -45,5 +47,6 @@ fn fs_main(input: VertexOutput) -> FragmentOutput {
     var output: FragmentOutput;
     output.color = input.color;
     output.velocity = input.velocity;
+    output.surface = vec4<f32>(0.0);
     return output;
 }

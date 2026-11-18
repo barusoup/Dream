@@ -1,5 +1,6 @@
 #[cfg(doc)]
 use super::PulledMesh;
+use super::create_shadow_pipeline;
 use super::pipeline::{
     allocate_sets, binding, build_display, build_targets, composes_direct, create_descriptor_pool,
     create_dsl, create_graphics_pipeline, create_graphics_pipeline_fs, create_pipeline_layout,
@@ -8,11 +9,12 @@ use super::pipeline::{
 };
 use super::vulkan;
 use super::{
-    ColorVertex, DEPTH_FORMAT, FramePhases, GpuContext, Renderer, SCENE_FORMAT, VELOCITY_FORMAT,
-    ViewUniform,
+    ColorVertex, DEPTH_FORMAT, FramePhases, GpuContext, GpuPreference, Renderer,
+    SCENE_COLOR_FORMATS, ViewUniform,
 };
 use crate::camera::Camera;
 use crate::fsr3::{Fsr3, JitterSequence};
+use crate::render::RenderSettings;
 use crate::settings::{AaMode, Settings};
 use crate::ui::render::UiBlend;
 use ash::vk;
@@ -41,6 +43,31 @@ fn swapchain_options(
 }
 
 impl Renderer {
+    /// Return the optional hardware ray-tracing scene, creating it on first
+    /// access when the device supports ray queries. Returns `None` on devices
+    /// without the complete Vulkan ray-tracing feature set. No resources are
+    /// allocated until this method is called.
+    pub fn ray_tracing_scene_mut(&mut self) -> Option<&mut super::RayTracingScene> {
+        if !self.ctx.ray_tracing_supported() {
+            return None;
+        }
+        Some(
+            self.rt_scene
+                .get_or_insert_with(|| super::rt::RayTracingScene::new(&self.ctx)),
+        )
+    }
+
+    /// Release cached ray-tracing geometry and per-frame acceleration structures.
+    /// Call when discarding a world or level to reclaim its registrations. This
+    /// waits for GPU use to finish and invalidates temporal history. `World`
+    /// registers its needed meshes again on its next RT frame; manually held
+    /// mesh handles become invalid and must be registered again.
+    pub fn clear_ray_tracing_scene(&mut self) {
+        if self.rt_scene.take().is_some() {
+            self.reset_history();
+        }
+    }
+
     /// Build a renderer whose UI blends in [`UiBlend::default()`]
     /// ([`UiBlend::Gamma`], browser-matching).
     pub fn new(window: Arc<Window>, shader_src: &str, settings: Settings) -> Self {
@@ -50,7 +77,7 @@ impl Renderer {
             None,
             settings,
             UiBlend::default(),
-            crate::gfx::GpuPreference::HighPerformance,
+            GpuPreference::default(),
         )
     }
 
@@ -71,17 +98,19 @@ impl Renderer {
             None,
             settings,
             blend,
-            crate::gfx::GpuPreference::HighPerformance,
+            GpuPreference::default(),
         )
     }
 
-    /// Like [`Self::new_with_ui_blend`], selecting an adapter according to `preference`.
+    /// Like [`Self::new_with_ui_blend`], with an explicit [`GpuPreference`]
+    /// for multi-GPU systems (e.g. [`GpuPreference::LowPower`] for UI-only
+    /// desktop apps on laptops).
     pub fn new_with_options(
         window: Arc<Window>,
         shader_src: &str,
         settings: Settings,
         blend: UiBlend,
-        preference: crate::gfx::GpuPreference,
+        preference: GpuPreference,
     ) -> Self {
         Self::new_inner(window, shader_src, None, settings, blend, preference)
     }
@@ -103,7 +132,7 @@ impl Renderer {
             Some(pulling_shader_src),
             settings,
             UiBlend::default(),
-            crate::gfx::GpuPreference::HighPerformance,
+            GpuPreference::default(),
         )
     }
 
@@ -113,7 +142,7 @@ impl Renderer {
         pulling_shader_src: Option<&str>,
         settings: Settings,
         ui_blend: UiBlend,
-        preference: crate::gfx::GpuPreference,
+        preference: GpuPreference,
     ) -> Self {
         let size = window.inner_size();
         let display_size = (size.width.max(1), size.height.max(1)); // requested
@@ -122,11 +151,10 @@ impl Renderer {
         let ctx = GpuContext::new_owned_with_preference(window.clone(), preference);
 
         let temporal = matches!(settings.aa, AaMode::Fsr);
-        let render_scale = if temporal {
-            settings.render_scale().clamp(0.1, 1.0)
-        } else {
-            1.0
-        };
+        // TAA always renders at native resolution; FSR keeps its preset scale,
+        // remembered so `set_aa_mode` can return to it.
+        let fsr_render_scale = settings.render_scale().clamp(0.1, 1.0);
+        let render_scale = if temporal { fsr_render_scale } else { 1.0 };
         let present_mode = vulkan::PresentMode::default();
         let swapchain = vulkan::Swapchain::new_with(
             &ctx,
@@ -207,10 +235,27 @@ impl Renderer {
             &[vertex_binding],
             &vertex_attrs,
             scene_layout,
-            &[SCENE_FORMAT, VELOCITY_FORMAT],
+            &SCENE_COLOR_FORMATS,
             Some(DEPTH_FORMAT),
         );
-        let blit_layout = create_pipeline_layout(&ctx, "blit layout", &[blit_dsl], &[]);
+        // Depth-only twin of the scene pipeline for sun shadow passes: same
+        // shader and vertex input, vertex stage only.
+        let shadow_scene_pipeline = create_shadow_pipeline(
+            &ctx,
+            scene_shader,
+            c"vs_main",
+            &[vertex_binding],
+            &vertex_attrs,
+            scene_layout,
+            ctx.shadow_depth_format(),
+            None,
+        );
+        // Fragment push constants for the blit's tone curve and dither (`BlitPush`).
+        let blit_push = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<super::frame::BlitPush>() as u32);
+        let blit_layout = create_pipeline_layout(&ctx, "blit layout", &[blit_dsl], &[blit_push]);
         let blit_pipeline = create_graphics_pipeline_fs(
             &ctx,
             blit_shader,
@@ -247,12 +292,26 @@ impl Renderer {
                 &[],
                 &[],
                 layout,
-                &[SCENE_FORMAT, VELOCITY_FORMAT],
+                &SCENE_COLOR_FORMATS,
                 Some(DEPTH_FORMAT),
             );
+            let shadow = create_shadow_pipeline(
+                &ctx,
+                shader,
+                c"vs_main",
+                &[],
+                &[],
+                layout,
+                ctx.shadow_depth_format(),
+                None,
+            );
             unsafe { ctx.device().destroy_shader_module(shader, None) };
-            (pipeline, layout, pulled_dsl)
+            (pipeline, layout, pulled_dsl, shadow)
         });
+        let (pulling, shadow_pulling) = match pulling {
+            Some((pipeline, layout, dsl, shadow)) => (Some((pipeline, layout, dsl)), Some(shadow)),
+            None => (None, None),
+        };
 
         unsafe {
             ctx.device().destroy_shader_module(scene_shader, None);
@@ -260,7 +319,7 @@ impl Renderer {
         }
 
         let descriptor_pool = create_descriptor_pool(&ctx, ctx.max_frames_in_flight());
-        let (scene_sets, blit_set, present_set) =
+        let (scene_sets, blit_sets, present_set) =
             allocate_sets(&ctx, descriptor_pool, &scene_dsl, &blit_dsl);
 
         let max_frames = ctx.max_frames_in_flight();
@@ -288,7 +347,7 @@ impl Renderer {
 
         // Allocate a 1x1 placeholder until a frame actually records 3D scene
         // draws (or requests a scene readback/thumbnail): UI-only apps never
-        // pay for full-resolution HDR color/velocity/depth or FSR 3.1 targets.
+        // pay for full-resolution HDR color/velocity/surface/depth or FSR 3.1 targets.
         let targets = build_targets(&ctx, (1, 1));
         let thumb = None;
         let fsr = None;
@@ -332,12 +391,13 @@ impl Renderer {
             ui_blend,
         );
 
+        let pass_timer = super::pass_timer::PassTimer::new(&ctx, max_frames);
         let gpu_pool = unsafe {
             ctx.device()
                 .create_query_pool(
                     &vk::QueryPoolCreateInfo::default()
                         .query_type(vk::QueryType::TIMESTAMP)
-                        .query_count(2 * max_frames as u32),
+                        .query_count(6 * max_frames as u32),
                     None,
                 )
                 .expect("renderer timestamp pool")
@@ -354,7 +414,7 @@ impl Renderer {
             blit_dsl,
             descriptor_pool,
             scene_sets,
-            blit_set,
+            blit_sets,
             sampler,
             scene_uniforms,
             frame_pool,
@@ -366,14 +426,37 @@ impl Renderer {
             frame: 0,
             frame_id: 0,
             gpu_pool,
+            pass_timer,
             scene_ms: vec![0.0; max_frames],
+            post_ms: vec![0.0; max_frames],
+            shadow_ms: vec![0.0; max_frames],
             scene_sample: None,
             scene_recorded: vec![false; max_frames],
+            occlusion: None,
+            occlusion_data: None,
+            occlusion_pending: vec![None; max_frames],
+            occlusion_generation: 0,
             targets,
             targets_ready: false,
             thumb,
             fsr,
             fsr_enabled: temporal,
+            aa_mode: settings.aa,
+            taa: None,
+            linear_depth: None,
+            indirect: None,
+            reflection: None,
+            atmosphere: None,
+            fog: None,
+            clouds: None,
+            rt_scene: None,
+            sky_cpu: Default::default(),
+            scene_time: 0.0,
+            scene_time_scale: 1.0,
+            prev_sky_view_proj: glam::Mat4::IDENTITY,
+            screen_generation: 0,
+            fsr_render_scale,
+            parked_token: None,
             display,
             display_live,
             display_written: false,
@@ -398,6 +481,12 @@ impl Renderer {
             phases: FramePhases::default(),
             acquire: super::acquire::AcquireWorker::new(),
             frame_wait_budget: None,
+            render_settings: RenderSettings::default(),
+            shadows: None,
+            shadow_generation: 0,
+            shadow_all_dirty: true,
+            shadow_scene_pipeline,
+            shadow_pulling_pipeline: shadow_pulling,
         };
         renderer.write_sets();
         renderer
@@ -412,6 +501,11 @@ impl Renderer {
         // a token it already delivered carries a dead image index (see
         // `quiesce_gpu`).
         self.quiesce_gpu();
+        // Its image belongs to the swapchain being replaced: release the slot
+        // and let the next frame acquire afresh.
+        if let Some(token) = self.parked_token.take() {
+            self.reclaim_slot(token.slot);
+        }
 
         // Hand the retired swapchain back so the driver can reuse the window.
         let old = self.swapchain.swapchain;
@@ -449,8 +543,15 @@ impl Renderer {
                 self.targets.depth.view,
             ]);
         }
+        // TAA is sized to the render target, so it is rebuilt; its history
+        // is invalid after a resize anyway.
+        self.taa = None;
+        self.sync_taa();
+        self.drop_screen_space();
+        self.sync_screen_space();
         self.history_valid = false;
         self.jitter.reset();
+        self.shadow_all_dirty = true;
         self.write_sets();
         self.acquire.respawn();
     }
@@ -588,9 +689,14 @@ impl Renderer {
     ///
     /// Joining first keeps the device wait from overlapping a
     /// `vkAcquireNextImageKHR` on the worker thread.
-    fn quiesce_gpu(&mut self) {
-        if let Some(Ok(token)) = self.acquire.shutdown() {
-            self.reclaim_slot(token.slot);
+    pub(super) fn quiesce_gpu(&mut self) {
+        // A token that already landed holds a swapchain image the next frame
+        // will present; drop it here and the image is lost to the swapchain for
+        // good. Park it instead. Resize retires the swapchain and discards it.
+        if let Some(Ok(token)) = self.acquire.shutdown()
+            && let Some(stale) = self.parked_token.replace(token)
+        {
+            self.reclaim_slot(stale.slot);
         }
         // Read the serial before waiting: idle covers every submission made so
         // far, and a submission another thread makes later must not be confirmed.
@@ -640,6 +746,193 @@ impl Renderer {
         self.ui.last_prepared_counts()
     }
 
+    /// The anti-aliasing mode in effect: [`AaMode::None`], [`AaMode::Fsr`] or
+    /// [`AaMode::Taa`].
+    pub fn aa_mode(&self) -> AaMode {
+        self.aa_mode
+    }
+
+    /// Switch between no anti-aliasing, FSR 3.1 and native TAA at runtime.
+    ///
+    /// The GPU is waited idle, the render size is recomputed (TAA and no AA
+    /// render at native resolution, FSR at its preset scale), the upscaler and
+    /// TAA resources the new mode needs are built or freed, and the temporal
+    /// history is reset. Scene targets are rebuilt only when they exist; they
+    /// are otherwise created on first use.
+    pub fn set_aa_mode(&mut self, mode: AaMode) {
+        if self.aa_mode == mode {
+            return;
+        }
+        self.quiesce_gpu();
+        self.aa_mode = mode;
+        self.fsr_enabled = mode == AaMode::Fsr;
+        self.temporal = mode == AaMode::Fsr;
+        self.render_scale = if mode == AaMode::Fsr {
+            self.fsr_render_scale
+        } else {
+            1.0
+        };
+        self.render_size = scaled_size(self.display_size, self.render_scale);
+        self.history_valid = false;
+        self.jitter.reset();
+        // Upscalers are rebuilt from scratch: their size and history belong to
+        // the mode that made them.
+        self.fsr = None;
+        self.taa = None;
+        self.drop_screen_space();
+        if self.targets_ready {
+            self.targets = build_targets(&self.ctx, self.render_size);
+            if self.fsr_enabled {
+                self.build_fsr();
+            }
+        }
+        self.sync_taa();
+        self.sync_screen_space();
+        self.write_sets();
+        self.acquire.respawn();
+    }
+
+    /// Whether TAA is the anti-aliasing mode (see [`Self::set_aa_mode`]).
+    pub(super) fn taa_active(&self) -> bool {
+        self.aa_mode == AaMode::Taa
+    }
+
+    /// Create the FSR upscaler over the current scene targets.
+    fn build_fsr(&mut self) {
+        let mut fsr = Fsr3::new(
+            &self.ctx,
+            self.render_size,
+            self.display_size,
+            [
+                self.targets.color.view,
+                self.targets.velocity.view,
+                self.targets.depth.view,
+            ],
+        );
+        fsr.write_rcas_config(self.sharpness);
+        self.fsr = Some(fsr);
+    }
+
+    /// Free every screen-space chain and the shared linear depth. Their images
+    /// are waited on in their `Drop`s.
+    fn drop_screen_space(&mut self) {
+        self.indirect = None;
+        self.reflection = None;
+        self.linear_depth = None;
+        self.screen_generation += 1;
+    }
+
+    /// Build or free the screen-space chains so each exists exactly when it is
+    /// enabled and the scene targets are allocated:
+    ///
+    /// - the indirect chain (AO or GI), at its own half-resolution choice;
+    /// - the reflection chain, at its own half-resolution choice;
+    /// - the shared linear depth, whenever either chain runs, at the finer of
+    ///   their resolutions (full when any chain runs at full resolution).
+    ///
+    /// A chain whose half-resolution choice no longer matches is rebuilt.
+    fn sync_screen_space(&mut self) {
+        let settings = &self.render_settings;
+        let want_indirect = self.targets_ready && (settings.ao.is_some() || settings.gi.is_some());
+        let indirect_half = settings.indirect_quality.half_res;
+        let want_reflection = self.targets_ready && settings.reflections.is_some();
+        let reflection_half = settings.reflections.is_some_and(|r| r.half_res);
+        // The view clouds read the depth per pixel, so they need it at full resolution.
+        let want_clouds = self.targets_ready && settings.clouds.is_some();
+        // The depth is built at the finer resolution of the chains that run.
+        let depth_half = !want_clouds
+            && (!want_indirect || indirect_half)
+            && (!want_reflection || reflection_half);
+        let want_depth = want_indirect || want_reflection || want_clouds;
+
+        let mut changed = false;
+        if self
+            .indirect
+            .as_ref()
+            .is_some_and(|chain| !want_indirect || chain.half_res() != indirect_half)
+        {
+            self.indirect = None;
+            changed = true;
+        }
+        if self
+            .reflection
+            .as_ref()
+            .is_some_and(|chain| !want_reflection || chain.half_res() != reflection_half)
+        {
+            self.reflection = None;
+            changed = true;
+        }
+        let mut depth_rebuilt = false;
+        if self
+            .linear_depth
+            .as_ref()
+            .is_some_and(|depth| !want_depth || depth.half_res() != depth_half)
+        {
+            self.linear_depth = None;
+            changed = true;
+            depth_rebuilt = true;
+        }
+        if want_depth && self.linear_depth.is_none() {
+            self.linear_depth = Some(super::linear_depth::LinearDepth::new(
+                &self.ctx,
+                self.render_size,
+                depth_half,
+            ));
+            changed = true;
+            depth_rebuilt = true;
+        }
+        if depth_rebuilt {
+            if let Some(chain) = &mut self.indirect {
+                chain.invalidate_history();
+            }
+            if let Some(chain) = &mut self.reflection {
+                chain.invalidate_history();
+            }
+        }
+        if want_indirect && self.indirect.is_none() {
+            self.indirect = Some(super::indirect::Indirect::new(
+                &self.ctx,
+                self.render_size,
+                indirect_half,
+            ));
+            changed = true;
+        }
+        if want_reflection && self.reflection.is_none() {
+            self.reflection = Some(super::reflection::Reflection::new(
+                &self.ctx,
+                self.render_size,
+                reflection_half,
+            ));
+            changed = true;
+        }
+        if changed {
+            self.screen_generation += 1;
+        }
+    }
+
+    /// Build or free the TAA passes so they exist exactly when the mode is TAA
+    /// and the scene targets are allocated. Freeing a live one waits the GPU idle.
+    fn sync_taa(&mut self) {
+        let want = self.targets_ready && self.taa_active();
+        match (want, self.taa.is_some()) {
+            (true, false) => self.taa = Some(super::taa::Taa::new(&self.ctx, self.render_size)),
+            (false, true) => self.taa = None,
+            _ => {}
+        }
+    }
+
+    /// Point this frame slot's blit set at `view`, the image the blit samples.
+    /// Each slot has its own set, and only the slot being recorded writes it.
+    pub(super) fn bind_blit_source(&self, frame: usize, view: vk::ImageView) {
+        let source = sampled(view);
+        let sampler = sampler_info(self.sampler);
+        let writes = [
+            image_write(self.blit_sets[frame], 0, &source),
+            sampler_write(self.blit_sets[frame], 1, &sampler),
+        ];
+        write_sets(&self.ctx, &writes);
+    }
+
     /// Enable or disable the temporal upscaler. Without a renderer that was
     /// built for it, enabling does nothing; see [`Self::toggle_temporal`].
     pub fn set_temporal(&mut self, enabled: bool) {
@@ -682,22 +975,8 @@ impl Renderer {
             write_sets(&self.ctx, &[uniform_write(*set, 0, &scene_buffer)]);
         }
 
-        let source = match self
-            .fsr
-            .as_ref()
-            .filter(|_| self.temporal && self.targets_ready)
-        {
-            Some(fsr) => fsr.output_view(),
-            None => self.targets.color.view,
-        };
-        let image = sampled(source);
-        let sampler = sampler_info(self.sampler);
-        let writes = [
-            image_write(self.blit_set, 0, &image),
-            sampler_write(self.blit_set, 1, &sampler),
-        ];
-        write_sets(&self.ctx, &writes);
-
+        // The blit sets are bound per frame slot in `bind_blit_source`, when the
+        // frame knows its source image.
         let display = sampled(self.display.view);
         let sampler = sampler_info(self.sampler);
         let writes = [
@@ -717,6 +996,92 @@ impl Renderer {
     pub fn reset_history(&mut self) {
         self.history_valid = false;
         self.jitter.reset();
+        self.shadow_all_dirty = true;
+        self.drop_occlusion_history();
+    }
+
+    /// The most recent occlusion grid read back from the GPU, or `None` when
+    /// the feature is off, no frame has completed yet, or history was reset.
+    /// It describes a frame up to three frames old: see
+    /// [`crate::cull::OcclusionBuffer::frame_id`].
+    pub fn occlusion(&self) -> Option<&crate::cull::OcclusionBuffer> {
+        self.occlusion_data.as_deref()
+    }
+
+    /// Forget every pending and published occlusion grid. Grids recorded before
+    /// this call are discarded when their slot completes.
+    pub(super) fn drop_occlusion_history(&mut self) {
+        self.occlusion_data = None;
+        self.occlusion_generation += 1;
+        self.occlusion_pending.iter_mut().for_each(|p| *p = None);
+    }
+
+    /// Build or free the Hi-Z pass so it exists exactly when occlusion is
+    /// enabled, at the current render size and settings.
+    pub(super) fn sync_occlusion(&mut self) {
+        let want = self.render_settings.occlusion;
+        let current_ok = match (&self.occlusion, want) {
+            (None, None) => true,
+            (Some(hiz), Some(settings)) => {
+                hiz.render_size() == self.render_size && *hiz.settings() == settings
+            }
+            _ => false,
+        };
+        if current_ok {
+            return;
+        }
+        self.occlusion = None;
+        self.drop_occlusion_history();
+        if let Some(settings) = want {
+            self.occlusion = Some(super::hiz::HiZ::new(&self.ctx, self.render_size, settings));
+        }
+    }
+
+    /// Scene-wide render settings in effect (clamped to their documented ranges).
+    /// Nothing is allocated for a setting that is off.
+    pub fn render_settings(&self) -> &RenderSettings {
+        &self.render_settings
+    }
+
+    /// Replace the render settings. Changes apply from the next
+    /// [`Self::render_scene`] frame: every cascade re-renders once, and the
+    /// shadow map is rebuilt only when its size or cascade count changed. Turning
+    /// shadows off frees the map. The GPU is waited idle when the map is dropped.
+    pub fn set_render_settings(&mut self, settings: RenderSettings) {
+        let settings = settings.sanitised();
+        if settings == self.render_settings {
+            return;
+        }
+        if settings.ray_tracing != self.render_settings.ray_tracing {
+            if settings.ray_tracing.is_none() {
+                self.clear_ray_tracing_scene();
+            }
+            self.reset_history();
+        }
+        self.render_settings = settings;
+        self.shadow_all_dirty = true;
+        self.drop_stale_shadow_map();
+        self.sync_screen_space();
+        self.sync_sky(false);
+    }
+
+    /// Scene time in seconds, which drives the fog's noise drift.
+    pub fn scene_time(&self) -> f64 {
+        self.scene_time
+    }
+
+    /// Set the scene time, in seconds (for example to scrub, or to fix it for a capture).
+    pub fn set_scene_time(&mut self, seconds: f64) {
+        self.scene_time = if seconds.is_finite() { seconds } else { 0.0 };
+    }
+
+    /// Multiplier on the frame delta that advances the scene time. Zero pauses it.
+    pub fn set_scene_time_scale(&mut self, scale: f32) {
+        self.scene_time_scale = if scale.is_finite() {
+            scale.clamp(0.0, 100.0)
+        } else {
+            1.0
+        };
     }
 
     /// Whether the temporal upscaler exists (built with `aa = "fsr"`).
@@ -731,19 +1096,10 @@ impl Renderer {
         self.targets_ready = true;
         self.targets = build_targets(&self.ctx, self.render_size);
         if self.fsr_enabled && self.fsr.is_none() {
-            let mut fsr = Fsr3::new(
-                &self.ctx,
-                self.render_size,
-                self.display_size,
-                [
-                    self.targets.color.view,
-                    self.targets.velocity.view,
-                    self.targets.depth.view,
-                ],
-            );
-            fsr.write_rcas_config(self.sharpness);
-            self.fsr = Some(fsr);
+            self.build_fsr();
         }
+        self.sync_taa();
+        self.sync_screen_space();
         self.write_sets();
     }
 
@@ -764,8 +1120,14 @@ impl Renderer {
         }
         // Nothing in flight may touch the targets once they are freed.
         unsafe { self.ctx.device().device_wait_idle() }.expect("wait idle on scene release");
-        // Fsr3's Drop waits idle and destroys its own resources.
+        self.clear_ray_tracing_scene();
+        // Fsr3's and Taa's Drop wait idle and destroy their own resources.
         self.fsr = None;
+        self.taa = None;
+        self.atmosphere = None;
+        self.fog = None;
+        self.clouds = None;
+        self.drop_screen_space();
         if let Some(thumb) = self.thumb.take() {
             thumb.destroy(self.ctx.device());
         }
@@ -836,6 +1198,10 @@ impl Drop for Renderer {
             device.destroy_pipeline(self.scene_pipeline, None);
             device.destroy_pipeline(self.blit_pipeline, None);
             device.destroy_pipeline(self.present_pipeline, None);
+            device.destroy_pipeline(self.shadow_scene_pipeline, None);
+            if let Some(pipeline) = self.shadow_pulling_pipeline {
+                device.destroy_pipeline(pipeline, None);
+            }
             if let Some(thumb) = self.thumb.as_ref() {
                 thumb.destroy(device);
             }

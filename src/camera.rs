@@ -17,6 +17,7 @@ pub struct Camera {
     keys: HashSet<KeyCode>,
     caps_boost: bool,
     aspect: f32,
+    fov_y: f32,
 }
 
 impl Default for Camera {
@@ -30,6 +31,7 @@ impl Default for Camera {
             keys: HashSet::new(),
             caps_boost: false,
             aspect: 16.0 / 9.0,
+            fov_y: Self::FOV_Y,
         }
     }
 }
@@ -37,9 +39,16 @@ impl Default for Camera {
 impl Camera {
     const FOV_Y: f32 = 70_f32.to_radians();
 
-    /// Vertical field of view in radians.
+    /// Vertical field of view in radians (70 degrees by default).
     pub fn fov_y(&self) -> f32 {
-        Self::FOV_Y
+        self.fov_y
+    }
+
+    /// Set the vertical field of view in radians, clamped to 5..170 degrees.
+    pub fn set_fov_y(&mut self, fov_y: f32) {
+        if fov_y.is_finite() {
+            self.fov_y = fov_y.clamp(5_f32.to_radians(), 170_f32.to_radians());
+        }
     }
 
     pub fn aspect(&self) -> f32 {
@@ -180,29 +189,19 @@ impl Camera {
 
     pub fn view_projection(&self) -> Mat4 {
         let (near, far) = self.clip_planes();
-        Mat4::perspective_rh(Self::FOV_Y, self.aspect, near, far) * self.view()
+        Mat4::perspective_rh(self.fov_y, self.aspect, near, far) * self.view()
     }
 
+    /// Conservative sphere test against this camera's view frustum (near and
+    /// far planes included). See [`crate::cull::Frustum`] for batch tests.
     pub fn sphere_visible(&self, center: Vec3, radius: f32) -> bool {
-        let forward = self.forward();
-        let right = forward.cross(Vec3::Y).normalize_or_zero();
-        let up = right.cross(forward).normalize_or_zero();
-        let offset = center - self.position;
-        let depth = offset.dot(forward);
-        let (near, far) = self.clip_planes();
-        if depth + radius < near || depth - radius > far {
-            return false;
-        }
-        let tan_v = (Self::FOV_Y * 0.5).tan();
-        let tan_h = tan_v * self.aspect;
-        let depth = depth.max(0.0);
-        offset.dot(right).abs() <= depth * tan_h + radius * tan_h.hypot(1.0)
-            && offset.dot(up).abs() <= depth * tan_v + radius * tan_v.hypot(1.0)
+        crate::cull::Frustum::from_view_projection(self.view_projection())
+            .contains_sphere(center, radius)
     }
 
     pub fn jittered_projection(&self, jitter_pixels: [f32; 2], size_pixels: [f32; 2]) -> Mat4 {
         let (near, far) = self.clip_planes();
-        let mut projection = Mat4::perspective_rh(Self::FOV_Y, self.aspect, near, far);
+        let mut projection = Mat4::perspective_rh(self.fov_y, self.aspect, near, far);
         projection.z_axis.x += 2.0 * jitter_pixels[0] / size_pixels[0].max(1.0);
         projection.z_axis.y += 2.0 * jitter_pixels[1] / size_pixels[1].max(1.0);
         projection

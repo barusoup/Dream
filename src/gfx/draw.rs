@@ -1,4 +1,4 @@
-use super::{DrawCtx, GpuBuffer, PulledMesh};
+use super::{DrawCtx, GpuBuffer, PulledMesh, ScenePass};
 use ash::vk;
 
 impl<'a> DrawCtx<'a> {
@@ -41,6 +41,50 @@ impl<'a> DrawCtx<'a> {
         self.scene_set
     }
 
+    /// Which pass this context records: the main pass or one shadow cascade.
+    /// Only [`crate::gfx::Renderer::render_scene`] produces shadow passes.
+    pub fn pass(&self) -> ScenePass {
+        self.pass
+    }
+
+    /// Whether this is a depth-only sun shadow pass. Draws that should not cast
+    /// shadows, such as transparent surfaces, skip themselves here.
+    pub fn is_shadow_pass(&self) -> bool {
+        matches!(self.pass, ScenePass::Shadow { .. })
+    }
+
+    /// Whether this frame records a transparent pass after the main pass
+    /// (true for [`crate::gfx::Renderer::render_scene`]). When it does,
+    /// alpha-blended draws belong to [`ScenePass::Transparent`] and the
+    /// built-in renderers skip them in [`ScenePass::Main`]. Custom code should
+    /// make the same choice: draw blended geometry when `pass()` is
+    /// `Transparent`, not in `Main`.
+    pub fn has_transparent_pass(&self) -> bool {
+        self.has_transparent
+    }
+
+    /// The built-in vertex helpers below do nothing in the transparent pass:
+    /// they bind the opaque scene pipeline, which would write motion vectors
+    /// and surface data over the opaque surfaces behind the blended ones.
+    fn skips_helpers(&self) -> bool {
+        self.pass == ScenePass::Transparent
+    }
+
+    /// The matrix geometry is transformed by in this pass: the jittered camera
+    /// matrix in the main pass, the cascade's light matrix in a shadow pass.
+    /// Use it for frustum culling.
+    pub fn view_projection(&self) -> glam::Mat4 {
+        self.view_proj
+    }
+
+    /// The occlusion grid read back from earlier frames, for culling in the
+    /// main pass. `None` when [`crate::render::RenderSettings::occlusion`] is
+    /// off, before the first grid arrives, and in shadow passes (shadows must
+    /// keep every caster, including the ones the camera cannot see).
+    pub fn occlusion(&self) -> Option<&crate::cull::OcclusionBuffer> {
+        self.occlusion
+    }
+
     /// Bind the indexed pipeline, the camera set, and `buffer` as vertex
     /// input. The pipeline/set rebind keeps this correct after pulled draws.
     pub fn bind_vertex_buffer(&mut self, buffer: &GpuBuffer) {
@@ -48,6 +92,9 @@ impl<'a> DrawCtx<'a> {
     }
 
     pub fn bind_index_buffer(&mut self, buffer: &GpuBuffer) {
+        if self.skips_helpers() {
+            return;
+        }
         self.ensure_started();
         unsafe {
             self.device
@@ -56,6 +103,9 @@ impl<'a> DrawCtx<'a> {
     }
 
     pub fn draw_indexed(&mut self, index_count: u32) {
+        if self.skips_helpers() {
+            return;
+        }
         self.ensure_started();
         unsafe {
             self.device
@@ -67,6 +117,9 @@ impl<'a> DrawCtx<'a> {
     /// buffers, the span's byte offsets select where within them this tile
     /// lives. `vertex_offset` is a vertex index (elements, not bytes).
     pub fn bind_vertex_buffer_at(&mut self, buffer: &GpuBuffer, byte_offset: u64) {
+        if self.skips_helpers() {
+            return;
+        }
         self.ensure_started();
         unsafe {
             self.device.cmd_bind_pipeline(
@@ -88,6 +141,9 @@ impl<'a> DrawCtx<'a> {
     }
 
     pub fn bind_index_buffer_at(&mut self, buffer: &GpuBuffer, byte_offset: u64) {
+        if self.skips_helpers() {
+            return;
+        }
         self.ensure_started();
         unsafe {
             self.device.cmd_bind_index_buffer(
@@ -102,6 +158,9 @@ impl<'a> DrawCtx<'a> {
     /// `first_index` counts indices inside the bound index buffer;
     /// `vertex_offset` shifts indices into the vertex span (elements).
     pub fn draw_indexed_range(&mut self, index_count: u32, first_index: u32, vertex_offset: i32) {
+        if self.skips_helpers() {
+            return;
+        }
         self.ensure_started();
         unsafe {
             self.device
@@ -142,6 +201,9 @@ impl<'a> DrawCtx<'a> {
 
     /// Draw every quad of `mesh` expanded to six vertices each.
     pub fn draw_pulled(&mut self, mesh: &PulledMesh, origin: [f32; 3]) {
+        if self.skips_helpers() {
+            return;
+        }
         self.draw_pulled_range(mesh, origin, 0, mesh.quad_count());
     }
 
@@ -153,6 +215,9 @@ impl<'a> DrawCtx<'a> {
         first_quad: u32,
         quad_count: u32,
     ) {
+        if self.skips_helpers() {
+            return;
+        }
         // Out-of-range stays invalid even when nothing would be drawn.
         assert!(
             first_quad <= mesh.quad_count() && quad_count <= mesh.quad_count() - first_quad,
@@ -179,6 +244,9 @@ impl<'a> DrawCtx<'a> {
         indirect: &GpuBuffer,
         byte_offset: u64,
     ) {
+        if self.skips_helpers() {
+            return;
+        }
         // vkCmdDrawIndirect requires 4-byte-aligned offsets into a buffer
         // that still holds the whole command struct.
         assert!(

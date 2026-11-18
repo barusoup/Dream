@@ -83,6 +83,7 @@
 
 use super::Rect;
 use super::atlas::AtlasConfig;
+use super::draw::UiFrame;
 use super::font::Fonts;
 use super::render::UiBlend;
 use super::theme::Theme;
@@ -91,6 +92,7 @@ use crate::app::FramePacing;
 use crate::gfx::{GpuPreference, PresentMode, Renderer, SurfaceError};
 use crate::memory::{IdleTrim, trim_working_set};
 use crate::settings::Settings;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -216,10 +218,31 @@ pub trait UiApp {
     /// than assigning it from a response.
     fn view(&mut self, ui: &mut Ui, cx: &mut AppContext<'_>);
 
+    /// Observe window input before the UI processes it.
+    fn window_input(&mut self, _event: &WindowEvent, _window: &Window) {}
+
+    /// Observe raw device input, for example relative first-person mouse motion.
+    fn device_input(&mut self, _event: &winit::event::DeviceEvent) {}
+
     /// The window's close button was pressed. Return `false` to keep the app
     /// running. The default closes the window.
     fn close_requested(&mut self, _cx: &mut AppContext<'_>) -> bool {
         true
+    }
+
+    /// Draw a 3D scene under the UI, in the same submission. Called once per
+    /// presented frame, after [`Self::view`], with the UI frame `view` built:
+    /// pass it to [`crate::world::World::render`] (or
+    /// [`crate::gfx::Renderer::render_scene`]) as its UI, and return that
+    /// call's result. Return `None` (the default) to present the UI alone.
+    /// Ask for the next frame with [`AppContext::request_frame`] to keep a
+    /// scene animating.
+    fn draw_scene(
+        &mut self,
+        _ui: &UiFrame,
+        _cx: &mut AppContext<'_>,
+    ) -> Option<Result<(), SurfaceError>> {
+        None
     }
 }
 
@@ -230,6 +253,7 @@ pub struct AppContext<'a> {
     renderer: &'a mut Renderer,
     theme: &'a Theme,
     waker: &'a AppWaker,
+    held: &'a HashSet<KeyCode>,
     scale: f32,
     exit: bool,
     frame: bool,
@@ -273,6 +297,12 @@ impl AppContext<'_> {
     /// Change the window title.
     pub fn set_title(&self, title: &str) {
         self.window.set_title(title);
+    }
+
+    /// Whether a physical key is held down right now. Held state follows the
+    /// window's key events; it is not cleared when the window loses focus.
+    pub fn key_held(&self, code: KeyCode) -> bool {
+        self.held.contains(&code)
     }
 
     /// The renderer, for anything the runner does not wrap: textures,
@@ -434,6 +464,8 @@ struct Runner<A> {
     /// When the UI's next timer (`Ui::next_wake_in`) is due.
     ui_wake: Option<Instant>,
     exit_requested: bool,
+    /// Physical keys currently held, for [`AppContext::key_held`].
+    held: HashSet<KeyCode>,
     memory: IdleTrim,
     /// Whether IME composition is currently enabled on the window.
     ime_allowed: bool,
@@ -479,6 +511,7 @@ impl<A: UiApp> Runner<A> {
             refresh_cache: None,
             ui_wake: None,
             exit_requested: false,
+            held: HashSet::new(),
             memory: IdleTrim::new(),
             ime_allowed: false,
             last_cursor: None,
@@ -494,12 +527,14 @@ impl<A: UiApp> Runner<A> {
     ) -> Option<R> {
         let scale = self.scale;
         let waker = &self.waker;
+        let held = &self.held;
         let live = self.live.as_mut()?;
         let mut cx = AppContext {
             window: &live.window,
             renderer: &mut live.renderer,
             theme: &live.theme,
             waker,
+            held,
             scale,
             exit: false,
             frame: false,
@@ -598,12 +633,24 @@ impl<A: UiApp> Runner<A> {
         }
         self.animating = live.ui.animating();
         let wake = live.ui.next_wake_in();
-        let frame_sig = frame.content_signature();
-        if !self.animating
+        // An app with a 3D scene draws it with this UI frame in one submission;
+        // otherwise the UI alone is presented.
+        let scene = self
+            .with_app(|app, _ui, cx| app.draw_scene(&frame, cx))
+            .flatten();
+        let frame_sig = if scene.is_none() {
+            frame.content_signature()
+        } else {
+            None
+        };
+        if scene.is_none()
+            && !self.animating
             && self.last_presented_sig.is_some()
             && frame_sig == self.last_presented_sig
         {
-            live.ui.recycle_frame(frame);
+            if let Some(live) = self.live.as_mut() {
+                live.ui.recycle_frame(frame);
+            }
             let done = Instant::now();
             self.last_frame = Some(done);
             self.ui_wake = wake.map(|after| done + after);
@@ -613,8 +660,16 @@ impl<A: UiApp> Runner<A> {
             }
             return;
         }
-        let presented = live.renderer.render_ui_only(Some(&frame));
-        live.ui.recycle_frame(frame);
+        let presented = match scene {
+            Some(result) => result,
+            None => match self.live.as_mut() {
+                Some(live) => live.renderer.render_ui_only(Some(&frame)),
+                None => return,
+            },
+        };
+        if let Some(live) = self.live.as_mut() {
+            live.ui.recycle_frame(frame);
+        }
         if let Err(err) = presented {
             self.last_presented_sig = None;
             match classify_frame_failure(err) {
@@ -623,7 +678,9 @@ impl<A: UiApp> Runner<A> {
                     return;
                 }
                 FrameFailure::Recreate => {
-                    live.renderer.recreate_swapchain();
+                    if let Some(live) = self.live.as_mut() {
+                        live.renderer.recreate_swapchain();
+                    }
                     self.dirty = true;
                     return;
                 }
@@ -663,6 +720,13 @@ impl<A: UiApp> Runner<A> {
     /// physical control keys. A composition in flight owns the characters.
     fn keyboard(&mut self, event: &KeyEvent) {
         let pressed = event.state == ElementState::Pressed;
+        if let PhysicalKey::Code(code) = event.physical_key {
+            if pressed {
+                self.held.insert(code);
+            } else {
+                self.held.remove(&code);
+            }
+        }
         if self.preedit.is_none()
             && let Some(text) = event.logical_key.to_text()
         {
@@ -763,6 +827,15 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
         }
     }
 
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        self.app.device_input(&event);
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::RedrawRequested => {
@@ -777,6 +850,9 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
         }
         if self.live.is_none() {
             return;
+        }
+        if let Some(live) = &self.live {
+            self.app.window_input(&event, &live.window);
         }
         // Any event but a redraw is user activity, which restarts the quiet
         // period before the next idle trim.

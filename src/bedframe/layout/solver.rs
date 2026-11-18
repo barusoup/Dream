@@ -323,7 +323,11 @@ impl LayoutTree {
             first = false;
         }
         self.kids_scratch = kids;
-        Ax::of(dir, main, cross + pad.cross).wh(dir)
+        Ax {
+            main,
+            cross: cross + pad.cross,
+        }
+        .wh(dir)
     }
 
     /// Lay out the whole tree in `root`.

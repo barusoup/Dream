@@ -1,8 +1,9 @@
 // Dream app scene shader.
 //
 // The engine's scene-pass contract: camera block at set 0 (jittered render
-// projection plus the unjittered pair for motion vectors), colour and
-// velocity attachments, linear-light colour out.
+// projection plus the unjittered pair for motion vectors), colour, velocity
+// and surface attachments, linear-light colour out. Surface is zero: this
+// scene has no lit surfaces.
 //
 // One addition: a screen-space path for the themed sky. Its vertices are
 // marked with a sentinel `position.x` and carry NDC in `(y, z)`, so the
@@ -30,6 +31,7 @@ struct VertexOutput {
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) velocity: vec2<f32>,
+    @location(2) surface: vec4<f32>,
 };
 
 const SKY_SENTINEL: f32 = 1.0e30;
@@ -65,5 +67,6 @@ fn fs_main(input: VertexOutput) -> FragmentOutput {
     var output: FragmentOutput;
     output.color = vec4<f32>(input.color);
     output.velocity = input.velocity;
+    output.surface = vec4<f32>(0.0);
     return output;
 }

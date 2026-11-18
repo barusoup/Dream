@@ -961,7 +961,6 @@ impl ImpostorAsset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn gpu_ctx() -> Option<Arc<GpuContext>> {
         std::panic::catch_unwind(|| {

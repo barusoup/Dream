@@ -2,8 +2,12 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AaMode {
+    /// No temporal anti-aliasing: the scene is blitted at its render size.
     None,
+    /// FSR 3.1 temporal upscaling, at the render scale of [`UpscalePreset`].
     Fsr,
+    /// Native-resolution temporal anti-aliasing (`crate::render::TaaSettings`).
+    Taa,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +72,8 @@ impl Settings {
                     out.aa = AaMode::None;
                 } else if line.contains("fsr") {
                     out.aa = AaMode::Fsr;
+                } else if line.contains("taa") {
+                    out.aa = AaMode::Taa;
                 }
             } else if line.starts_with("upscale") {
                 if line.contains("quality") {

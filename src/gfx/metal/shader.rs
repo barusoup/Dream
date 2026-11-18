@@ -47,6 +47,22 @@ impl MslBindings {
         self
     }
 
+    /// Map Dream's shared `@group(3)` lighting bindings (`lighting.wgsl` bindings
+    /// `0..=10`) starting at `(buf_base, tex_base, samp_base)` in Metal slots.
+    pub fn lighting_group3(self, buf_base: u8, tex_base: u8, samp_base: u8) -> Self {
+        self.buffer(3, 0, buf_base, false)
+            .buffer(3, 1, buf_base + 1, false)
+            .texture(3, 2, tex_base)
+            .sampler(3, 3, samp_base)
+            .texture(3, 4, tex_base + 1)
+            .texture(3, 5, tex_base + 2)
+            .sampler(3, 6, samp_base + 1)
+            .texture(3, 7, tex_base + 3)
+            .texture(3, 8, tex_base + 4)
+            .sampler(3, 9, samp_base + 2)
+            .texture(3, 10, tex_base + 5)
+    }
+
     pub fn hash_key(&self) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         let mix = |h: &mut u64, v: u64| {

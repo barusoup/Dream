@@ -1,4 +1,4 @@
-use super::pipeline::create_pbr_pipeline;
+use super::pipeline::{create_pbr_pipeline, create_pbr_shadow_pipeline};
 use super::{MaterialFactors, PbrMaterialGpu, PbrState, scene_set_layout};
 use crate::gfx::vulkan::GpuContext;
 use crate::model::Material;
@@ -149,6 +149,11 @@ impl PbrMaterialGpu {
             material.occlusion_texture.as_ref(),
             material.emissive_texture.as_ref(),
         ];
+        let map_flags = u32::from(material.normal_texture.is_some())
+            | (u32::from(material.occlusion_texture.is_some()) << 1)
+            | (u32::from(material.metallic_roughness_texture.is_some()) << 2)
+            | (u32::from(material.emissive_texture.is_some()) << 3)
+            | (u32::from(material.base_color_map.is_some()) << 4);
         let mut factors = MaterialFactors {
             params: [
                 material.metallic_factor,
@@ -163,7 +168,7 @@ impl PbrMaterialGpu {
             params2: [
                 material.occlusion_strength,
                 material.normal_scale,
-                0.0,
+                map_flags as f32,
                 material.base_color[3], // materialAlphaFactor
             ],
             emissive: [
@@ -338,13 +343,142 @@ impl PbrState {
             ),
             "model_pbr",
         );
-        let pipeline = create_pbr_pipeline(ctx, shader, layout, color_formats, depth_format, false);
-        let pipeline_blended =
-            create_pbr_pipeline(ctx, shader, layout, color_formats, depth_format, true);
+        let shadow_format = ctx.shadow_depth_format();
+        let pipeline = create_pbr_pipeline(
+            ctx,
+            shader,
+            layout,
+            color_formats,
+            depth_format,
+            false,
+            c"vs_main",
+            false,
+            vk::CullModeFlags::NONE,
+        );
+        let pipeline_cull = create_pbr_pipeline(
+            ctx,
+            shader,
+            layout,
+            color_formats,
+            depth_format,
+            false,
+            c"vs_main",
+            false,
+            vk::CullModeFlags::BACK,
+        );
+        let pipeline_blended = create_pbr_pipeline(
+            ctx,
+            shader,
+            layout,
+            color_formats,
+            depth_format,
+            true,
+            c"vs_main",
+            false,
+            vk::CullModeFlags::NONE,
+        );
+        let pipeline_transparent = create_pbr_pipeline(
+            ctx,
+            shader,
+            layout,
+            color_formats,
+            depth_format,
+            true,
+            c"vs_main",
+            true,
+            vk::CullModeFlags::NONE,
+        );
+        let shadow_opaque = create_pbr_shadow_pipeline(
+            ctx,
+            shader,
+            layout,
+            shadow_format,
+            false,
+            c"vs_main",
+            vk::CullModeFlags::NONE,
+        );
+        let shadow_opaque_cull = create_pbr_shadow_pipeline(
+            ctx,
+            shader,
+            layout,
+            shadow_format,
+            false,
+            c"vs_main",
+            vk::CullModeFlags::BACK,
+        );
+        let shadow_mask = create_pbr_shadow_pipeline(
+            ctx,
+            shader,
+            layout,
+            shadow_format,
+            true,
+            c"vs_main",
+            vk::CullModeFlags::NONE,
+        );
+        // Instanced twins: same shader, `vs_instanced` placed by the draw block.
+        let pipeline_instanced = create_pbr_pipeline(
+            ctx,
+            shader,
+            layout,
+            color_formats,
+            depth_format,
+            false,
+            c"vs_instanced",
+            false,
+            vk::CullModeFlags::NONE,
+        );
+        let pipeline_instanced_cull = create_pbr_pipeline(
+            ctx,
+            shader,
+            layout,
+            color_formats,
+            depth_format,
+            false,
+            c"vs_instanced",
+            false,
+            vk::CullModeFlags::BACK,
+        );
+        let shadow_instanced_opaque = create_pbr_shadow_pipeline(
+            ctx,
+            shader,
+            layout,
+            shadow_format,
+            false,
+            c"vs_instanced",
+            vk::CullModeFlags::NONE,
+        );
+        let shadow_instanced_opaque_cull = create_pbr_shadow_pipeline(
+            ctx,
+            shader,
+            layout,
+            shadow_format,
+            false,
+            c"vs_instanced",
+            vk::CullModeFlags::BACK,
+        );
+        let shadow_instanced_mask = create_pbr_shadow_pipeline(
+            ctx,
+            shader,
+            layout,
+            shadow_format,
+            true,
+            c"vs_instanced",
+            vk::CullModeFlags::NONE,
+        );
         unsafe { ctx.device().destroy_shader_module(shader, None) };
         Self {
             pipeline,
+            pipeline_cull,
             pipeline_blended,
+            pipeline_transparent,
+            shadow_opaque,
+            shadow_opaque_cull,
+            shadow_mask,
+            pipeline_instanced,
+            pipeline_instanced_cull,
+            shadow_instanced_opaque,
+            shadow_instanced_opaque_cull,
+            shadow_instanced_mask,
             layout,
             dsl_material,
         }

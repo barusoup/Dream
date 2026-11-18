@@ -1,7 +1,7 @@
 //! Native qualification for baked-asset shipping and multi-asset draw safety.
 //! Run with a fresh output directory, then repeat with `--load-only`.
 use dream::camera::Camera;
-use dream::gfx::{DEPTH_FORMAT, Renderer, SCENE_FORMAT, VELOCITY_FORMAT};
+use dream::gfx::{DEPTH_FORMAT, Renderer, SCENE_COLOR_FORMATS};
 use dream::impostor::{
     AssetDebug, BakeSettings, ImpostorAsset, ImpostorAssetLimits, ImpostorBaker, ImpostorInstance,
     ImpostorRenderer, ImpostorSource,
@@ -25,9 +25,9 @@ const RESIDENT_LIMIT: u64 = 1280 * 1024 * 1024;
 const SCENE: &str = r#"
 struct In { @location(0) p: vec3<f32>, @location(1) c: vec4<f32> };
 struct V { @builtin(position) p: vec4<f32>, @location(0) c: vec4<f32> };
-struct F { @location(0) c: vec4<f32>, @location(1) v: vec2<f32> };
+struct F { @location(0) c: vec4<f32>, @location(1) v: vec2<f32>, @location(2) s: vec4<f32> };
 @vertex fn vs_main(i: In) -> V { return V(vec4<f32>(i.p, 1.0), i.c); }
-@fragment fn fs_main(i: V) -> F { return F(i.c, vec2<f32>(0.0)); }
+@fragment fn fs_main(i: V) -> F { return F(i.c, vec2<f32>(0.0), vec4<f32>(0.0)); }
 "#;
 
 fn add_box(m: &mut Model, lo: Vec3, hi: Vec3, material: usize) {
@@ -375,13 +375,8 @@ fn run(event_loop: &ActiveEventLoop, dir: &Path, load_only: bool) -> bool {
     let lighting = Lighting::new(&ctx);
     let mut camera = Camera::default();
     camera.set_aspect(W as f32 / H as f32);
-    let cards = ImpostorRenderer::new(
-        &ctx,
-        &[SCENE_FORMAT, VELOCITY_FORMAT],
-        DEPTH_FORMAT,
-        &lighting,
-    );
-    let models = ModelRenderer::new(&ctx, &[SCENE_FORMAT, VELOCITY_FORMAT], DEPTH_FORMAT);
+    let cards = ImpostorRenderer::new(&ctx, &SCENE_COLOR_FORMATS, DEPTH_FORMAT, &lighting);
+    let models = ModelRenderer::new(&ctx, &SCENE_COLOR_FORMATS, DEPTH_FORMAT);
     let baker = (!load_only).then(|| ImpostorBaker::new(&ctx));
     let mut items = Vec::new();
     let mut resident = 0u64;
@@ -842,7 +837,25 @@ impl Check {
             && zero_d
                 .chunks_exact(4)
                 .all(|d| f32::from_le_bytes(d.try_into().unwrap()) == 1.0);
-        let fade_exact = fade_v == card_v;
+        // A fractional weight is a per-pixel dither now, not alpha: every
+        // covered pixel carries either the full card's motion or nothing (the
+        // cleared value), and about the weight's share of them is kept.
+        let (mut covered, mut kept, mut partial) = (0usize, 0usize, false);
+        for (i, d) in card_d.chunks_exact(4).enumerate() {
+            if f32::from_le_bytes(d.try_into().unwrap()) >= 1.0 {
+                continue;
+            }
+            covered += 1;
+            let off = i * 4;
+            let (f, c) = (&fade_v[off..off + 4], &card_v[off..off + 4]);
+            if f == c {
+                kept += 1;
+            } else if !f.iter().all(|b| *b == 0) {
+                partial = true;
+            }
+        }
+        let kept_share = kept as f64 / covered.max(1) as f64;
+        let fade_exact = !partial && covered > 0 && (0.35..=0.65).contains(&kept_share);
         let ok = finite
             && count >= 100
             && max_motion > 0.001
@@ -851,7 +864,7 @@ impl Check {
             && fade_exact
             && zero_clean;
         println!(
-            "[v1] moving-transform velocity mean={mean:.6} max={max_delta:.6} samples={count} fade-exact={fade_exact} zero-clean={zero_clean} {}",
+            "[v1] moving-transform velocity mean={mean:.6} max={max_delta:.6} samples={count} fade-dither={fade_exact} kept={kept_share:.3} zero-clean={zero_clean} {}",
             if ok { "ok" } else { "FAIL" }
         );
         ok

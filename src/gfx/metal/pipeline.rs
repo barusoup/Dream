@@ -68,13 +68,10 @@ pub(crate) fn scene_region(
 }
 
 pub(crate) fn display_format(swapchain_format: MTLPixelFormat, blend: UiBlend) -> MTLPixelFormat {
-    match blend {
-        UiBlend::Gamma => match swapchain_format {
-            MTLPixelFormat::BGRA8Unorm_sRGB => MTLPixelFormat::BGRA8Unorm,
-            MTLPixelFormat::RGBA8Unorm_sRGB => MTLPixelFormat::RGBA8Unorm,
-            other => other,
-        },
-        UiBlend::Linear => swapchain_format,
+    match (blend, swapchain_format) {
+        (UiBlend::Gamma, MTLPixelFormat::BGRA8Unorm_sRGB) => MTLPixelFormat::BGRA8Unorm,
+        (UiBlend::Gamma, MTLPixelFormat::RGBA8Unorm_sRGB) => MTLPixelFormat::RGBA8Unorm,
+        _ => swapchain_format,
     }
 }
 

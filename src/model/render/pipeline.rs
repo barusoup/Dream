@@ -2,27 +2,13 @@ use super::{ModelVertex, PbrVertex, SkinnedVertex};
 use crate::gfx::vulkan::GpuContext;
 use ash::vk;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn create_model_pipeline(
-    ctx: &GpuContext,
-    shader: vk::ShaderModule,
-    layout: vk::PipelineLayout,
-    color_formats: &[vk::Format],
-    depth_format: vk::Format,
-    entry: &std::ffi::CStr,
+/// Vertex buffers and attributes of the simple model path: static or skinned.
+fn model_vertex_input(
     skinned: bool,
-    blended: bool,
-) -> vk::Pipeline {
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(shader)
-            .name(entry),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(shader)
-            .name(c"fs_main"),
-    ];
+) -> (
+    Vec<vk::VertexInputBindingDescription>,
+    Vec<vk::VertexInputAttributeDescription>,
+) {
     let bindings = if skinned {
         vec![
             vk::VertexInputBindingDescription::default()
@@ -71,6 +57,32 @@ pub(super) fn create_model_pipeline(
                 .offset(40),
         );
     }
+    (bindings, attrs)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn create_model_pipeline(
+    ctx: &GpuContext,
+    shader: vk::ShaderModule,
+    layout: vk::PipelineLayout,
+    color_formats: &[vk::Format],
+    depth_format: vk::Format,
+    entry: &std::ffi::CStr,
+    skinned: bool,
+    blended: bool,
+    transparent: bool,
+) -> vk::Pipeline {
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(shader)
+            .name(entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(shader)
+            .name(c"fs_main"),
+    ];
+    let (bindings, attrs) = model_vertex_input(skinned);
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)
         .vertex_attribute_descriptions(&attrs);
@@ -94,15 +106,25 @@ pub(super) fn create_model_pipeline(
         } else {
             vk::CompareOp::LESS
         });
-    // One blend entry per colour attachment (colour + velocity): a single
-    // entry leaves the second attachment's write mask undefined, and the
-    // velocity target is never written.
+    // One blend entry per colour attachment (colour, velocity, surface): a
+    // single entry leaves the other attachments' write masks undefined, and
+    // those targets are never written. Blended (transparent) surfaces keep
+    // their surface data out of attachment 2 so they cannot overwrite the
+    // opaque surface behind them.
     let blend_attachments: Vec<_> = color_formats
         .iter()
         .enumerate()
         .map(|(index, _)| {
-            let attachment = vk::PipelineColorBlendAttachmentState::default()
+            let mut attachment = vk::PipelineColorBlendAttachmentState::default()
                 .color_write_mask(vk::ColorComponentFlags::RGBA);
+            // Transparent draws do not write motion vectors either: they are
+            // composited over the opaque velocity, which must survive.
+            if transparent && index == 1 {
+                attachment = attachment.color_write_mask(vk::ColorComponentFlags::empty());
+            }
+            if blended && index == 2 {
+                attachment = attachment.color_write_mask(vk::ColorComponentFlags::empty());
+            }
             if blended && index == 0 {
                 attachment
                     .blend_enable(true)
@@ -145,27 +167,11 @@ pub(super) fn create_model_pipeline(
     }
 }
 
-/// PBR pipeline: static meshes only, no culling (glTF `doubleSided`; the
-/// shader flips the normal on back faces), same blend contract as
-/// `create_model_pipeline`.
-pub(super) fn create_pbr_pipeline(
-    ctx: &GpuContext,
-    shader: vk::ShaderModule,
-    layout: vk::PipelineLayout,
-    color_formats: &[vk::Format],
-    depth_format: vk::Format,
-    blended: bool,
-) -> vk::Pipeline {
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(shader)
-            .name(c"vs_main"),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(shader)
-            .name(c"fs_main"),
-    ];
+/// Vertex layout of the PBR path (`PbrVertex`).
+fn pbr_vertex_input() -> (
+    [vk::VertexInputBindingDescription; 1],
+    [vk::VertexInputAttributeDescription; 5],
+) {
     let bindings = [vk::VertexInputBindingDescription::default()
         .binding(0)
         .stride(std::mem::size_of::<PbrVertex>() as u32)
@@ -197,6 +203,35 @@ pub(super) fn create_pbr_pipeline(
             .format(vk::Format::R32G32B32A32_SFLOAT)
             .offset(40),
     ];
+    (bindings, attrs)
+}
+
+/// PBR pipeline: static meshes only, no culling (glTF `doubleSided`; the
+/// shader flips the normal on back faces), same blend contract as
+/// `create_model_pipeline`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn create_pbr_pipeline(
+    ctx: &GpuContext,
+    shader: vk::ShaderModule,
+    layout: vk::PipelineLayout,
+    color_formats: &[vk::Format],
+    depth_format: vk::Format,
+    blended: bool,
+    vertex_entry: &std::ffi::CStr,
+    transparent: bool,
+    cull: vk::CullModeFlags,
+) -> vk::Pipeline {
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(shader)
+            .name(vertex_entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(shader)
+            .name(c"fs_main"),
+    ];
+    let (bindings, attrs) = pbr_vertex_input();
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)
         .vertex_attribute_descriptions(&attrs);
@@ -207,7 +242,7 @@ pub(super) fn create_pbr_pipeline(
         .scissor_count(1);
     let raster = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::NONE)
+        .cull_mode(cull)
         .front_face(vk::FrontFace::CLOCKWISE)
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -220,12 +255,22 @@ pub(super) fn create_pbr_pipeline(
         } else {
             vk::CompareOp::LESS
         });
+    // Attachment 2 is the surface target: blended surfaces leave it unwritten
+    // (see the matching comment in `create_model_pipeline`).
     let blend_attachments: Vec<_> = color_formats
         .iter()
         .enumerate()
         .map(|(index, _)| {
-            let attachment = vk::PipelineColorBlendAttachmentState::default()
+            let mut attachment = vk::PipelineColorBlendAttachmentState::default()
                 .color_write_mask(vk::ColorComponentFlags::RGBA);
+            // Transparent draws do not write motion vectors either: they are
+            // composited over the opaque velocity, which must survive.
+            if transparent && index == 1 {
+                attachment = attachment.color_write_mask(vk::ColorComponentFlags::empty());
+            }
+            if blended && index == 2 {
+                attachment = attachment.color_write_mask(vk::ColorComponentFlags::empty());
+            }
             if blended && index == 0 {
                 attachment
                     .blend_enable(true)
@@ -266,4 +311,52 @@ pub(super) fn create_pbr_pipeline(
             .map_err(|(_, err)| err)
             .expect("create pbr pipeline")[0]
     }
+}
+
+/// Depth-only twin of [`create_model_pipeline`] for sun shadow passes. Only
+/// opaque casters use it; blended draws are skipped by the caller.
+pub(super) fn create_model_shadow_pipeline(
+    ctx: &GpuContext,
+    shader: vk::ShaderModule,
+    layout: vk::PipelineLayout,
+    depth_format: vk::Format,
+    entry: &std::ffi::CStr,
+    skinned: bool,
+) -> vk::Pipeline {
+    let (bindings, attrs) = model_vertex_input(skinned);
+    crate::gfx::create_shadow_pipeline(
+        ctx,
+        shader,
+        entry,
+        &bindings,
+        &attrs,
+        layout,
+        depth_format,
+        None,
+    )
+}
+
+/// Shadow pass pipeline for PBR casters: vertex stage only for opaque
+/// materials, plus `fs_shadow` (alpha-mask cut-outs) when `mask` is set.
+pub(super) fn create_pbr_shadow_pipeline(
+    ctx: &GpuContext,
+    shader: vk::ShaderModule,
+    layout: vk::PipelineLayout,
+    depth_format: vk::Format,
+    mask: bool,
+    vertex_entry: &std::ffi::CStr,
+    cull: vk::CullModeFlags,
+) -> vk::Pipeline {
+    let (bindings, attrs) = pbr_vertex_input();
+    crate::gfx::create_shadow_pipeline_cull(
+        ctx,
+        shader,
+        vertex_entry,
+        &bindings,
+        &attrs,
+        layout,
+        depth_format,
+        mask.then_some(c"fs_shadow"),
+        cull,
+    )
 }

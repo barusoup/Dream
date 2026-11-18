@@ -1,6 +1,6 @@
 use crate::gfx::metal::GpuContext;
 use crate::gfx::metal::pipeline::{create_render_pipeline, make_viewport};
-use crate::gfx::metal::shader::MslBindings;
+use crate::gfx::metal::shader::{MslBindings, PUSH_CONSTANT_BUFFER_SLOT};
 use crate::texture::GpuTexture;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -9,6 +9,7 @@ use objc2_metal::{
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineState, MTLStoreAction,
     MTLTexture,
 };
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 const SHADER: &str = include_str!("../backdrop.wgsl");
@@ -46,12 +47,15 @@ pub(super) struct BlurPipelines {
 
 impl BlurPipelines {
     pub(super) fn new(ctx: &GpuContext, format: MTLPixelFormat) -> Self {
-        let bindings = MslBindings::new().texture(0, 0, 0).sampler(0, 1, 0);
+        let blur_bindings = MslBindings::new().texture(0, 0, 0).sampler(0, 1, 0);
+        let downsample_bindings = blur_bindings
+            .clone()
+            .push_constants(PUSH_CONSTANT_BUFFER_SLOT);
         let downsample = create_render_pipeline(
             ctx,
             "backdrop downsample",
             include_str!("../../blit.wgsl"),
-            &bindings,
+            &downsample_bindings,
             "vs_main",
             "fs_main",
             &[format],
@@ -63,7 +67,7 @@ impl BlurPipelines {
             ctx,
             "backdrop blur H",
             SHADER,
-            &bindings,
+            &blur_bindings,
             "vs_main",
             "fs_h",
             &[format],
@@ -75,7 +79,7 @@ impl BlurPipelines {
             ctx,
             "backdrop blur V",
             SHADER,
-            &bindings,
+            &blur_bindings,
             "vs_main",
             "fs_v",
             &[format],
@@ -98,10 +102,12 @@ pub(super) fn capture_backdrop_pass(
     backdrop: &Backdrop,
     target: &ProtocolObject<dyn MTLTexture>,
 ) {
+    let zero_blit_push = [0u8; 16];
     let run_pass = |from: &ProtocolObject<dyn MTLTexture>,
                     to: &ProtocolObject<dyn MTLTexture>,
                     to_size: (u32, u32),
-                    pipeline: &ProtocolObject<dyn MTLRenderPipelineState>| {
+                    pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
+                    with_push: bool| {
         let rpd = MTLRenderPassDescriptor::new();
         let att = unsafe { rpd.colorAttachments().objectAtIndexedSubscript(0) };
         att.setTexture(Some(to));
@@ -115,6 +121,13 @@ pub(super) fn capture_backdrop_pass(
         unsafe {
             enc.setFragmentTexture_atIndex(Some(from), 0);
             enc.setFragmentSamplerState_atIndex(Some(ctx.default_sampler()), 0);
+            if with_push {
+                enc.setFragmentBytes_length_atIndex(
+                    NonNull::new_unchecked(zero_blit_push.as_ptr() as *mut _),
+                    zero_blit_push.len(),
+                    PUSH_CONSTANT_BUFFER_SLOT as usize,
+                );
+            }
             enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         }
         enc.endEncoding();
@@ -125,12 +138,14 @@ pub(super) fn capture_backdrop_pass(
         backdrop.mid.texture(),
         backdrop.mid.size(),
         &blur.downsample,
+        true,
     );
     run_pass(
         backdrop.mid.texture(),
         backdrop.source.texture(),
         backdrop.source.size(),
         &blur.downsample,
+        true,
     );
 
     let qsize = backdrop.out.size();
@@ -145,6 +160,6 @@ pub(super) fn capture_backdrop_pass(
         (&backdrop.scratch, &backdrop.out, &blur.vertical),
     ];
     for (from, to, pipe) in steps {
-        run_pass(from.texture(), to.texture(), qsize, pipe);
+        run_pass(from.texture(), to.texture(), qsize, pipe, false);
     }
 }

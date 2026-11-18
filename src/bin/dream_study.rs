@@ -12,9 +12,7 @@
 
 use dream::audio::{Audio, AudioData, PlayParams};
 use dream::camera::Camera;
-use dream::gfx::{
-    ColorVertex, DEPTH_FORMAT, DrawCtx, GpuBuffer, Renderer, SCENE_FORMAT, VELOCITY_FORMAT,
-};
+use dream::gfx::{ColorVertex, DEPTH_FORMAT, DrawCtx, GpuBuffer, Renderer, SCENE_COLOR_FORMATS};
 use dream::model::render::{ModelGpu, ModelRenderer};
 use dream::model::{
     AnimClip, Channel, Interpolation, Key, Material, Mesh, Model, ModelInstance, Node, PlayMode,
@@ -525,11 +523,7 @@ impl ApplicationHandler for Run {
         strip_instance
             .player_mut()
             .play(Arc::new(strip.clips[0].clone()), PlayMode::Loop, 0.0);
-        let mut models = ModelRenderer::new(
-            renderer.context(),
-            &[SCENE_FORMAT, VELOCITY_FORMAT],
-            DEPTH_FORMAT,
-        );
+        let mut models = ModelRenderer::new(renderer.context(), &SCENE_COLOR_FORMATS, DEPTH_FORMAT);
         let mut tracker = MotionTracker::new();
 
         // --- UI ----------------------------------------------------------

@@ -54,6 +54,8 @@ struct Push {
     prev_model: mat4x4<f32>,
     // x: channel-debug code shared with impostor.wgsl
     // (10 albedo, 11 rough, 12 metal, 13 ao, 14 emissive, 15 world normal)
+    // y: LoD crossfade mesh weight, z: 1 when this draw is a dithered crossfade
+    // (main pass only; see `lod_dither`), 0 otherwise.
     debug: vec4<f32>,
 };
 var<push_constant> push: Push;
@@ -73,6 +75,7 @@ struct VertexOutput {
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) velocity: vec2<f32>,
+    @location(2) surface: vec4<f32>,
 };
 
 fn screen_uv(ndc: vec2<f32>) -> vec2<f32> {
@@ -85,17 +88,20 @@ fn velocity_of(world: vec4<f32>, prev_world: vec4<f32>) -> vec2<f32> {
     return screen_uv(prev_clip.xy / prev_clip.w) - screen_uv(curr_clip.xy / curr_clip.w);
 }
 
-@vertex
-fn vs_main(
-    @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) uv0: vec2<f32>,
-    @location(3) uv1: vec2<f32>,
-    @location(4) tangent: vec4<f32>,
+// Shared vertex body. `model` and `prev_model` place the vertex: push
+// constants in `vs_main`, the draw block's per-instance pair in `vs_instanced`.
+fn vertex_body(
+    position: vec3<f32>,
+    normal: vec3<f32>,
+    uv0: vec2<f32>,
+    uv1: vec2<f32>,
+    tangent: vec4<f32>,
+    model: mat4x4<f32>,
+    prev_model: mat4x4<f32>,
 ) -> VertexOutput {
     var output: VertexOutput;
-    let world = push.model * vec4<f32>(position, 1.0);
-    let prev_world = push.prev_model * vec4<f32>(position, 1.0);
+    let world = model * vec4<f32>(position, 1.0);
+    let prev_world = prev_model * vec4<f32>(position, 1.0);
     output.clip_position = camera.view_projection * world;
     output.uv0 = uv0;
     output.uv1 = uv1;
@@ -104,9 +110,9 @@ fn vs_main(
     // source bake already corrects. The determinant is evaluated on the
     // unit basis: cofactor cols are cross(nb,nc)/sa etc., det is the
     // unit-scale det — valid to the full 1e-6..1e6 scale contract.
-    let a = push.model[0].xyz;
-    let b = push.model[1].xyz;
-    let c = push.model[2].xyz;
+    let a = model[0].xyz;
+    let b = model[1].xyz;
+    let c = model[2].xyz;
     let sa = max(length(a), 1e-30);
     let sb = max(length(b), 1e-30);
     let sc = max(length(c), 1e-30);
@@ -125,13 +131,40 @@ fn vs_main(
     output.world_normal =
         normalize(select(vec3<f32>(0.0, 1.0, 0.0), n_raw, det_ok));
     output.world_tangent =
-        vec4<f32>((push.model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w * sign(det_u));
+        vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w * sign(det_u));
     output.det_sign = sign(det_u);
     output.world_pos = world.xyz;
     // Velocity is computed in the fragment: perspective division makes the
     // screen-space delta non-linear, so it can't be interpolated.
     output.prev_world = prev_world.xyz;
     return output;
+}
+
+@vertex
+fn vs_main(
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv0: vec2<f32>,
+    @location(3) uv1: vec2<f32>,
+    @location(4) tangent: vec4<f32>,
+) -> VertexOutput {
+    return vertex_body(position, normal, uv0, uv1, tangent, push.model, push.prev_model);
+}
+
+// Instanced static draws: `draw_data.joints[i]` holds instance i's
+// (model * node, prev_model * node) pair, written by `draw_pbr_instanced`.
+// The instance index is the draw's first instance plus the vertex's instance.
+@vertex
+fn vs_instanced(
+    @builtin(instance_index) instance: u32,
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv0: vec2<f32>,
+    @location(3) uv1: vec2<f32>,
+    @location(4) tangent: vec4<f32>,
+) -> VertexOutput {
+    let pair = draw_data.joints[instance];
+    return vertex_body(position, normal, uv0, uv1, tangent, pair.curr, pair.prev);
 }
 
 // Apply KHR_texture_transform: pick the UV set then uv' = R(rot) * (uv*scale) + offset.
@@ -165,20 +198,44 @@ fn tangent_frame(input: VertexOutput, uv: vec2<f32>, n: vec3<f32>) -> mat3x3<f32
     return mat3x3<f32>(t, b, n);
 }
 
+// Sun shadow pass for alpha-mask materials: cut out texels below the cutoff.
+// Opaque casters use the vertex stage alone; blended ones are never drawn.
+@fragment
+fn fs_shadow(input: VertexOutput) {
+    if material.params.w == 1.0 {
+        let mflags = u32(material.params2.z + 0.5);
+        var source_alpha = material.params2.w;
+        if (mflags & 16u) != 0u {
+            let uv_base = map_uv(material.uv0, material.tf0, input.uv0, input.uv1);
+            source_alpha *= textureSample(t_base, s_base, uv_base).a;
+        }
+        if source_alpha < material.params.z {
+            discard;
+        }
+    }
+}
+
 @fragment
 fn fs_main(
     input: VertexOutput,
     @builtin(front_facing) front_facing: bool,
 ) -> FragmentOutput {
     var output: FragmentOutput;
+    lighting_begin(input.clip_position.xy);
 
-    let uv_base = map_uv(material.uv0, material.tf0, input.uv0, input.uv1);
-    let uv_mr = map_uv(material.uv1, material.tf1, input.uv0, input.uv1);
-    let uv_nrm = map_uv(material.uv2, material.tf2, input.uv0, input.uv1);
-    let uv_ao = map_uv(material.uv3, material.tf3, input.uv0, input.uv1);
-    let uv_emi = map_uv(material.uv4, material.tf4, input.uv0, input.uv1);
+    // Dithered LoD crossfade: the mesh keeps the pixels whose threshold lies
+    // below its weight; the impostor keeps the rest (impostor.wgsl).
+    let dithered = push.debug.z > 0.5;
+    if dithered && lod_dither(input.clip_position.xy) >= push.debug.y {
+        discard;
+    }
 
-    let base_tex = textureSample(t_base, s_base, uv_base);
+    let mflags = u32(material.params2.z + 0.5);
+    var base_tex = vec4<f32>(1.0);
+    if (mflags & 16u) != 0u {
+        let uv_base = map_uv(material.uv0, material.tf0, input.uv0, input.uv1);
+        base_tex = textureSample(t_base, s_base, uv_base);
+    }
     let albedo = base_tex.rgb * draw_data.base_color.rgb;
     // draw_data.base_color.a is the CROSSFADE opacity (draw_pbr_with_opacity
     // writes it directly); the material's own alpha factor rides params2.w.
@@ -192,16 +249,31 @@ fn fs_main(
     // front face is the physical back face.
     let logical_front = select(front_facing, !front_facing, input.det_sign < 0.0);
     if !logical_front { n = -n; }
-    let nmap = textureSample(t_normal, s_normal, uv_nrm).xyz * 2.0 - 1.0;
-    let tbn = tangent_frame(input, uv_nrm, n);
-    n = normalize(tbn * (nmap * vec3<f32>(material.params2.y, material.params2.y, 1.0)));
+    if (mflags & 1u) != 0u && material.params2.y != 0.0 {
+        let uv_nrm = map_uv(material.uv2, material.tf2, input.uv0, input.uv1);
+        let nmap = textureSample(t_normal, s_normal, uv_nrm).xyz * 2.0 - 1.0;
+        let tbn = tangent_frame(input, uv_nrm, n);
+        n = normalize(tbn * (nmap * vec3<f32>(material.params2.y, material.params2.y, 1.0)));
+    }
 
-    let mr_tex = textureSample(t_mr, s_mr, uv_mr);
-    let roughness = mr_tex.g * material.params.y;
-    let metallic = mr_tex.b * material.params.x;
-    let ao = mix(1.0, textureSample(t_ao, s_ao, uv_ao).r, material.params2.x);
-    let emissive = textureSample(t_emissive, s_emissive, uv_emi).rgb
-        * material.emissive.rgb * material.emissive.a;
+    var roughness = material.params.y;
+    var metallic = material.params.x;
+    if (mflags & 4u) != 0u {
+        let uv_mr = map_uv(material.uv1, material.tf1, input.uv0, input.uv1);
+        let mr_tex = textureSample(t_mr, s_mr, uv_mr);
+        roughness *= mr_tex.g;
+        metallic *= mr_tex.b;
+    }
+    var ao = 1.0;
+    if (mflags & 2u) != 0u && material.params2.x != 0.0 {
+        let uv_ao = map_uv(material.uv3, material.tf3, input.uv0, input.uv1);
+        ao = mix(1.0, textureSample(t_ao, s_ao, uv_ao).r, material.params2.x);
+    }
+    var emissive = material.emissive.rgb * material.emissive.a;
+    if (mflags & 8u) != 0u && any(emissive != vec3<f32>(0.0)) {
+        let uv_emi = map_uv(material.uv4, material.tf4, input.uv0, input.uv1);
+        emissive *= textureSample(t_emissive, s_emissive, uv_emi).rgb;
+    }
 
     let dbg = u32(push.debug.x);
     if dbg >= 10u {
@@ -214,19 +286,24 @@ fn fs_main(
         if dbg == 16u { ch = input.world_pos * 0.25 + vec3<f32>(0.5); }
         output.color = vec4<f32>(ch, 1.0);
         output.velocity = vec2<f32>(0.0);
+        output.surface = surface_encode(n, roughness, metallic);
         return output;
     }
 
     let v = normalize(lighting_env.cam_pos.xyz - input.world_pos);
     let lit = lighting_eval(albedo, metallic, roughness, n, v, input.world_pos, ao);
-    // OPAQUE/MASK survivors carry only the crossfade opacity; BLEND keeps
-    // the real source alpha under it.
-    let out_alpha =
-        draw_data.base_color.a * select(1.0, source_alpha, material.params.w > 1.5);
+    // Ordinary draws carry the material alpha times the draw opacity (1 for
+    // opaque draws). A dithered crossfade is opaque by construction.
+    let out_alpha = select(
+        draw_data.base_color.a * select(1.0, source_alpha, material.params.w > 1.5),
+        1.0,
+        dithered,
+    );
     output.color = vec4<f32>(lit + emissive, out_alpha);
     output.velocity = velocity_of(
         vec4<f32>(input.world_pos, 1.0),
         vec4<f32>(input.prev_world, 1.0),
     );
+    output.surface = surface_encode(n, roughness, metallic);
     return output;
 }

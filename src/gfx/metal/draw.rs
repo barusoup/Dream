@@ -1,5 +1,5 @@
 use super::metal::shader::{PUSH_CONSTANT_BUFFER_SLOT, VERTEX_BUFFER_SLOT};
-use super::{DrawCtx, GpuBuffer, PulledMesh};
+use super::{DrawCtx, GpuBuffer, PulledMesh, ScenePass};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLDepthStencilState, MTLIndexType, MTLPrimitiveType, MTLRenderCommandEncoder,
@@ -26,6 +26,26 @@ impl<'a> DrawCtx<'a> {
 
     pub fn frame_id(&self) -> u64 {
         self.frame_id
+    }
+
+    pub fn pass(&self) -> ScenePass {
+        self.pass
+    }
+
+    pub fn is_shadow_pass(&self) -> bool {
+        matches!(self.pass, ScenePass::Shadow { .. })
+    }
+
+    pub fn has_transparent_pass(&self) -> bool {
+        self.has_transparent
+    }
+
+    pub fn view_projection(&self) -> glam::Mat4 {
+        self.view_proj
+    }
+
+    pub fn occlusion(&self) -> Option<&crate::cull::OcclusionBuffer> {
+        None
     }
 
     pub fn scene_uniform_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {

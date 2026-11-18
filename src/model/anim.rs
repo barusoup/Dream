@@ -200,6 +200,12 @@ impl Player {
         Self::default()
     }
 
+    /// Whether any clip is attached, finished or not. Conservative: a player
+    /// with a finished clip still reports `true` until it is replaced.
+    pub fn is_playing(&self) -> bool {
+        !self.slots.is_empty()
+    }
+
     /// Start `clip` from scratch (drops other slots). `fade_in` seconds of
     /// weight ramp, or 0 to snap.
     pub fn play(&mut self, clip: std::sync::Arc<AnimClip>, mode: PlayMode, fade_in: f32) {
@@ -253,6 +259,9 @@ impl Player {
     /// write their node; untouched nodes keep their pose's values.
     pub fn update(&mut self, dt: f32, nodes: usize, pose: &mut [NodePose]) {
         assert!(pose.len() >= nodes);
+        if self.slots.is_empty() {
+            return;
+        }
         // First channel wins per (node, target) inside one slot; slots blend
         // with weights. Accumulate per target across slots.
         let mut blended: Vec<Option<(Vec3, Quat, Vec3, f32)>> = vec![None; nodes];

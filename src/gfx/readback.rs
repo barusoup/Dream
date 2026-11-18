@@ -109,9 +109,210 @@ impl Renderer {
         (self.read_velocity_bytes(), w, h)
     }
 
+    /// Surface-data target (render resolution) converted to 8-bit RGBA, top row
+    /// first, 4 bytes per pixel, plus its dimensions. Source is
+    /// `A2B10G10R10_UNORM`: the 10-bit colour channels are rescaled to 0..255
+    /// and the 2-bit class in alpha to 0, 85, 170 or 255. Encoding is described
+    /// on [`crate::gfx::SURFACE_FORMAT`].
+    pub fn capture_surface_rgba8(&mut self) -> (Vec<u8>, u32, u32) {
+        let (w, h) = self.render_size;
+        let raw = self.read_color_image_bytes(self.targets.surface.image, "surface readback");
+        // Vulkan row 0 is the framebuffer's bottom row (see `capture_depth_f32`);
+        // flip so the output is top-first like the PNG captures.
+        let row = (w as usize) * 4;
+        let mut out = vec![0u8; raw.len()];
+        for y in 0..h as usize {
+            let src = &raw[(h as usize - 1 - y) * row..(h as usize - y) * row];
+            for (dst, texel) in out[y * row..(y + 1) * row]
+                .chunks_exact_mut(4)
+                .zip(src.chunks_exact(4))
+            {
+                let packed = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
+                let scale10 = |shift: u32| (((packed >> shift) & 0x3ff) * 255 + 511) / 1023;
+                dst[0] = scale10(0) as u8;
+                dst[1] = scale10(10) as u8;
+                dst[2] = scale10(20) as u8;
+                dst[3] = ((packed >> 30) & 0x3) as u8 * 85;
+            }
+        }
+        (out, w, h)
+    }
+
+    /// The latest indirect-chain output (AO and GI, see [`crate::render::AoSettings`]
+    /// and [`crate::render::GiSettings`]) as 8-bit RGBA, top row first. rgb is the
+    /// indirect diffuse light after a Reinhard curve, a is ambient visibility.
+    /// Returns `(bytes, width, height)` at the chain's working resolution, or
+    /// empty bytes and zero size before the chain has run.
+    ///
+    /// Intended for diagnostics: call it after the frames whose result you want.
+    pub fn capture_indirect_rgba8(&mut self) -> (Vec<u8>, u32, u32) {
+        self.ensure_scene_targets();
+        let source = self
+            .indirect
+            .as_ref()
+            .and_then(|chain| Some((chain.output_image()?, chain.working_size())));
+        self.capture_chain_rgba8(source, "indirect readback")
+    }
+
+    /// The latest screen-space reflection output as 8-bit RGBA, top row first:
+    /// rgb is the traced radiance after a Reinhard curve, a is the confidence
+    /// (see [`crate::render::ReflectionSettings`]). Returns `(bytes, width,
+    /// height)` at the chain's working resolution, or empty bytes and zero size
+    /// when reflections are off or the chain has not run.
+    ///
+    /// Intended for diagnostics: call it after the frames whose result you want.
+    pub fn capture_reflection_rgba8(&mut self) -> (Vec<u8>, u32, u32) {
+        self.ensure_scene_targets();
+        let source = self
+            .reflection
+            .as_ref()
+            .and_then(|chain| Some((chain.output_image()?, chain.working_size())));
+        self.capture_chain_rgba8(source, "reflection readback")
+    }
+
+    /// Read a screen-space chain's `image` (of `(w, h)` texels, RGBA16F) back as
+    /// 8-bit RGBA with the Reinhard curve, rows flipped to top-first.
+    fn capture_chain_rgba8(
+        &mut self,
+        source: Option<(vk::Image, (u32, u32))>,
+        label: &str,
+    ) -> (Vec<u8>, u32, u32) {
+        let Some((image, (w, h))) = source else {
+            return (Vec::new(), 0, 0);
+        };
+        let bytes = (w as u64) * (h as u64) * 8;
+        let buffer = self.ctx.create_readback_buffer(label, bytes);
+        let device = self.ctx.device().clone();
+        self.ctx.one_shot(|cmd| unsafe {
+            vulkan::image_barrier(
+                &device,
+                cmd,
+                image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::ImageAspectFlags::COLOR,
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                });
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                image,
+                vk::ImageLayout::GENERAL,
+                buffer.buffer,
+                &[region],
+            );
+        });
+        let raw = buffer
+            .mapped()
+            .expect("indirect readback buffer is host visible")
+            .to_vec();
+        // Vulkan row 0 is the bottom row (see `capture_surface_rgba8`): flip.
+        let row = (w as usize) * 8;
+        let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+        for y in 0..h as usize {
+            let src = &raw[(h as usize - 1 - y) * row..(h as usize - y) * row];
+            let dst_row = &mut out[y * (w as usize) * 4..(y + 1) * (w as usize) * 4];
+            for (dst, texel) in dst_row.chunks_exact_mut(4).zip(src.chunks_exact(8)) {
+                let channel =
+                    |i: usize| half_to_f32(u16::from_le_bytes([texel[2 * i], texel[2 * i + 1]]));
+                for (c, dst) in dst.iter_mut().enumerate().take(3) {
+                    let v = channel(c).max(0.0);
+                    *dst = ((v / (1.0 + v)) * 255.0 + 0.5) as u8;
+                }
+                dst[3] = (channel(3).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+        }
+        (out, w, h)
+    }
+
     /// Copy the scene depth target (render resolution, `D32_SFLOAT`, top row
     /// first, Vulkan clip depth 0..1 where 1.0 = far/cleared) to the CPU.
     /// Returns raw little-endian `f32` bytes, `render_size` texels.
+    /// Copy an RGBA16F image of `w` x `h` x `d` texels (GENERAL layout) to the
+    /// CPU as floats, four per texel, in texel order.
+    pub(super) fn read_half_image(
+        &mut self,
+        image: vk::Image,
+        (w, h, d): (u32, u32, u32),
+        label: &str,
+    ) -> Vec<f32> {
+        let bytes = u64::from(w) * u64::from(h) * u64::from(d) * 8;
+        let buffer = self.ctx.create_readback_buffer(label, bytes);
+        let device = self.ctx.device().clone();
+        self.ctx.one_shot(|cmd| unsafe {
+            vulkan::image_barrier(
+                &device,
+                cmd,
+                image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::ImageAspectFlags::COLOR,
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: d,
+                });
+            device.cmd_copy_image_to_buffer(
+                cmd,
+                image,
+                vk::ImageLayout::GENERAL,
+                buffer.buffer,
+                &[region],
+            );
+        });
+        let raw = buffer
+            .mapped()
+            .expect("half-float readback buffer is host visible");
+        raw.chunks_exact(2)
+            .map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect()
+    }
+
+    /// Float copy of the sky environment map of the last scene frame: mip 0, four
+    /// floats per texel (radiance rgb, 1), row 0 at the zenith (`v = 0`), with the
+    /// width and height. Empty when the atmosphere has no environment map.
+    pub fn capture_sky_env_rgba16f(&mut self) -> (Vec<f32>, u32, u32) {
+        let Some(slot) = self.last_scene_slot() else {
+            return (Vec::new(), 0, 0);
+        };
+        let Some(image) = self
+            .atmosphere
+            .as_ref()
+            .and_then(|atmosphere| atmosphere.env_map_image(slot))
+        else {
+            return (Vec::new(), 0, 0);
+        };
+        let (w, h) = crate::render::SKY_ENV_SIZE;
+        let raw = self.read_half_image(image, (w, h, 1), "sky environment map readback");
+        (raw, w, h)
+    }
+
     pub fn capture_depth_f32(&mut self) -> (Vec<u8>, u32, u32) {
         self.ensure_scene_targets();
         let (w, h) = self.render_size;
@@ -183,11 +384,16 @@ impl Renderer {
 
     /// Copy the motion-vector target (render resolution, f16 two-channel) to the CPU.
     fn read_velocity_bytes(&mut self) -> Vec<u8> {
+        self.read_color_image_bytes(self.targets.velocity.image, "velocity readback")
+    }
+
+    /// Copy a render-resolution 4-byte-per-texel colour target to the CPU, in
+    /// Vulkan row order. Ensures the scene targets exist first.
+    fn read_color_image_bytes(&mut self, image: vk::Image, label: &str) -> Vec<u8> {
         self.ensure_scene_targets();
         let (rw, rh) = self.render_size;
         let bytes = (rw as u64) * (rh as u64) * 4;
-        let buffer = self.ctx.create_readback_buffer("velocity readback", bytes);
-        let image = self.targets.velocity.image;
+        let buffer = self.ctx.create_readback_buffer(label, bytes);
         let device = self.ctx.device().clone();
         self.ctx.one_shot(|cmd| unsafe {
             vulkan::image_barrier(
@@ -224,7 +430,7 @@ impl Renderer {
         });
         buffer
             .mapped()
-            .expect("velocity buffer is host visible")
+            .expect("colour readback buffer is host visible")
             .to_vec()
     }
 
@@ -280,6 +486,31 @@ impl Renderer {
     /// this slot cycle, in milliseconds (0 when timestamps are unsupported).
     pub fn scene_gpu_ms(&self) -> f32 {
         self.scene_ms.iter().copied().fold(0.0, f32::max)
+    }
+
+    /// GPU time between the end of the scene pass and the start of the blit on
+    /// the most recently completed frame: the sky pass, the fog pass, the
+    /// screen-space chains, temporal upscaling and anti-aliasing, in milliseconds. Like [`Self::scene_gpu_ms`],
+    /// it is the largest value over the frame slots, and 0 when timestamps are
+    /// unsupported.
+    pub fn post_gpu_ms(&self) -> f32 {
+        self.post_ms.iter().copied().fold(0.0, f32::max)
+    }
+
+    /// GPU time of the sun shadow passes (every updated cascade) on the most
+    /// recently completed frame, in milliseconds. Like [`Self::scene_gpu_ms`],
+    /// the largest value over the frame slots, and 0 when timestamps are
+    /// unsupported or no cascade was rendered.
+    pub fn shadow_gpu_ms(&self) -> f32 {
+        self.shadow_ms.iter().copied().fold(0.0, f32::max)
+    }
+
+    /// GPU time of each pass of the scene and post work on the most recently
+    /// completed frame, in recording order: `(label, milliseconds)`. A pass lasts
+    /// from its mark to the next mark (see `gfx::pass_timer`). Empty when
+    /// timestamps are unsupported.
+    pub fn pass_gpu_ms(&self) -> Vec<(&'static str, f32)> {
+        self.pass_timer.timings()
     }
 
     /// Fresh completed scene-pass timestamp from the last render call.
@@ -499,4 +730,32 @@ fn f16_to_f32(h: u16) -> f32 {
         (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
     };
     f32::from_bits(bits)
+}
+
+/// Decode an IEEE 754 binary16 bit pattern.
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((bits >> 10) & 0x1f) as i32;
+    let mant = (bits & 0x3ff) as f32;
+    match exp {
+        0 => sign * mant * 2f32.powi(-24),
+        31 if mant == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + mant / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+#[cfg(test)]
+mod indirect_readback_tests {
+    use super::half_to_f32;
+
+    #[test]
+    fn indirect_half_float_decodes_known_patterns() {
+        assert_eq!(half_to_f32(0x0000), 0.0);
+        assert_eq!(half_to_f32(0x3c00), 1.0);
+        assert_eq!(half_to_f32(0xc000), -2.0);
+        assert_eq!(half_to_f32(0x3555), 0.333_251_95);
+        assert_eq!(half_to_f32(0x7c00), f32::INFINITY);
+        assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
 }

@@ -47,7 +47,9 @@ mod storage;
 pub use atlas::{AssetDebug, ImpostorAsset, ImpostorAssetLimits};
 pub use bake::{BakeSettings, ImpostorBaker, ImpostorSource};
 pub use lod::{LodChoice, LodOwner, LodPolicy, LodStats};
-pub use render::{ImpostorDrawError, ImpostorInstance, ImpostorInstanceError, ImpostorRenderer};
+pub use render::{
+    DEFAULT_FAR_PX, ImpostorDrawError, ImpostorInstance, ImpostorInstanceError, ImpostorRenderer,
+};
 pub use scene::{LodBatch, LodEntry};
 pub use storage::ImpostorAssetError;
 
@@ -55,11 +57,13 @@ pub use storage::ImpostorAssetError;
 use glam::IVec3;
 use glam::{Mat4, Vec3};
 
-/// The fourteen views an asset captures: three axis-aligned slab pairs plus
-/// four body-diagonal slab pairs. `dir` is the view direction the
-/// orthographic camera sits on, `u`/`v` the axes spanning the tile. Order is
-/// fixed — layer `f` of every channel image is `VIEWS[f]` — and mirrored
-/// verbatim in `impostor.wgsl` (the consistency test parses the shader).
+/// The [`VIEW_COUNT`] views an asset captures: six axis-aligned views, eight
+/// body-diagonal views (four slab pairs, which with the axes make the seven
+/// hull axes), and twelve edge-direction views used for shading only.
+/// `dir` is the view direction the orthographic camera sits on, `u`/`v` the
+/// axes spanning the tile. Order is fixed (layer `f` of every channel image
+/// is `VIEWS[f]`) and mirrored verbatim in `impostor.wgsl`; the consistency
+/// test parses the shader.
 #[derive(Clone, Copy, Debug)]
 pub struct View {
     pub dir: Vec3,

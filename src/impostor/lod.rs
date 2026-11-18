@@ -102,8 +102,12 @@ pub struct LodPolicy {
     /// Projected size at or above which the mesh comes back. Must be greater
     /// than `impostor_below`; that gap *is* the hysteresis.
     pub mesh_above: f32,
-    /// Part of the hysteresis band used to crossfade. `0.0` disables fading
-    /// and snaps at the switch points, `1.0` fades across the whole band.
+    /// Part of the hysteresis band used to crossfade in
+    /// [`LodPolicy::select_coverage`]: `0.0` snaps at the switch points, `1.0`
+    /// fades across the whole band. That band fade is a steady state while the
+    /// coverage sits inside it. [`crate::world::World`] does not use it: a
+    /// world switch crossfades for a fixed 0.25 s and then settles, so only the
+    /// hand-over thresholds and `max_distance` shape a world's LOD.
     pub fade: f32,
     /// Distance (world units) beyond which the impostor is always used
     /// regardless of projected size. Catches huge assets that would otherwise
@@ -134,8 +138,15 @@ impl LodPolicy {
     /// terms of "how many pixels does it cover" rather than world units, which
     /// is what makes one policy work for a pebble and a barn.
     pub fn screen_coverage(radius: f32, distance: f32) -> f32 {
+        Self::screen_coverage_fov(radius, distance, Self::HALF_FOV_TAN)
+    }
+
+    /// [`Self::screen_coverage`] for a camera whose vertical half field of
+    /// view has tangent `half_fov_tan` (`(fov_y * 0.5).tan()`). Use this with
+    /// the live camera, so a variable field of view does not skew the policy.
+    pub fn screen_coverage_fov(radius: f32, distance: f32, half_fov_tan: f32) -> f32 {
         let distance = distance.max(1e-3);
-        let coverage = (radius.abs() / distance) / Self::HALF_FOV_TAN;
+        let coverage = (radius.abs() / distance) / half_fov_tan.max(1e-6);
         if coverage.is_finite() {
             coverage.max(0.0)
         } else {
@@ -198,20 +209,39 @@ impl LodPolicy {
     /// radius`) — keep the mesh: no projected size derived from them can be
     /// trusted to justify the cheaper representation.
     pub fn select(&self, radius: f32, distance: f32, previous: LodChoice) -> LodChoice {
+        self.select_fov(radius, distance, previous, Self::HALF_FOV_TAN)
+    }
+
+    /// [`Self::select`] for a camera whose vertical half field of view has
+    /// tangent `half_fov_tan`. With [`Self::HALF_FOV_TAN`] it is `select`.
+    pub fn select_fov(
+        &self,
+        radius: f32,
+        distance: f32,
+        previous: LodChoice,
+        half_fov_tan: f32,
+    ) -> LodChoice {
         if !radius.is_finite() || !distance.is_finite() || radius <= 0.0 || distance <= radius {
             return LodChoice::Mesh;
         }
         let policy = self.sanitised();
-        let coverage = Self::screen_coverage(radius, distance);
-        // max_distance used to hard-snap to the impostor, which popped worse
-        // than any band crossing. Instead feed a synthetic coverage that
-        // equals `impostor_below` exactly at max_distance and shrinks past it:
-        // the approach fades through the same thresholds hysteresis already
-        // manages, and anything beyond the limit still ends on the impostor.
-        // f64 keeps the division exact for very large distances.
-        let synthetic =
-            (policy.impostor_below as f64 * policy.max_distance as f64 / distance as f64) as f32;
-        self.select_coverage(coverage.min(synthetic.max(0.0)), previous)
+        let coverage = Self::screen_coverage_fov(radius, distance, half_fov_tan);
+        self.select_coverage(
+            coverage.min(policy.max_distance_coverage(distance)),
+            previous,
+        )
+    }
+
+    /// The coverage cap that `max_distance` imposes at `distance`: it equals
+    /// `impostor_below` exactly at `max_distance` and shrinks past it.
+    /// Callers apply it with `min` to a measured coverage, so beyond the limit
+    /// the choice ends on the impostor. The approach still fades through the
+    /// hysteresis thresholds; nothing snaps at the limit. f64 keeps the
+    /// division exact for very large distances.
+    pub(crate) fn max_distance_coverage(&self, distance: f32) -> f32 {
+        let distance = distance.max(1e-3);
+        let cap = (self.impostor_below as f64 * self.max_distance as f64 / distance as f64) as f32;
+        cap.max(0.0)
     }
 
     /// The choice from an already-computed [`Self::screen_coverage`], for
@@ -685,6 +715,25 @@ mod tests {
     }
 
     #[test]
+    fn crossfade_dither_thresholds_tile_each_pixel_exactly() {
+        // The mesh keeps a pixel while its noise is below `mesh_weight()`; the
+        // impostor shader keeps it from `1 - impostor_weight()` up. The two
+        // must be the same f32, or a pixel is dropped or drawn twice.
+        for step in 0..=100_000u32 {
+            let t = step as f32 / 100_000.0;
+            let choice = LodChoice::Crossfade {
+                t,
+                owner: LodOwner::Mesh,
+            };
+            assert_eq!(
+                choice.mesh_weight(),
+                1.0 - choice.impostor_weight(),
+                "t = {t}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_selection_inputs_keep_the_mesh() {
         let p = policy();
         for (radius, distance) in [
@@ -878,5 +927,49 @@ mod tests {
         assert!(choice.is_impostor());
         // And a fresh object at 10x the limit is an impostor outright.
         assert!(p.select(1.0, 2000.0, LodChoice::Mesh).is_impostor());
+    }
+}
+
+#[cfg(test)]
+mod fov_tests {
+    use super::*;
+
+    #[test]
+    fn lod_policy_select_fov_default_matches_select() {
+        let policy = LodPolicy::default();
+        for (radius, distance) in [(1.0f32, 5.0f32), (2.0, 90.0), (1.0, 400.0), (50.0, 3000.0)] {
+            for previous in [LodChoice::Mesh, LodChoice::Impostor] {
+                assert_eq!(
+                    policy.select(radius, distance, previous),
+                    policy.select_fov(radius, distance, previous, LodPolicy::HALF_FOV_TAN),
+                    "radius {radius} distance {distance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lod_policy_select_fov_narrow_lens_sees_larger_coverage() {
+        let policy = LodPolicy::default();
+        // Coverage 0.01 at the default field of view (below impostor_below);
+        // 0.035 with a 0.2 tangent (above mesh_above).
+        let radius = 1.0;
+        let distance = radius / (0.01 * LodPolicy::HALF_FOV_TAN);
+        assert_eq!(
+            policy.select_fov(radius, distance, LodChoice::Mesh, LodPolicy::HALF_FOV_TAN),
+            LodChoice::Impostor
+        );
+        assert_eq!(
+            policy.select_fov(radius, distance, LodChoice::Mesh, 0.2),
+            LodChoice::Mesh
+        );
+    }
+
+    #[test]
+    fn lod_policy_screen_coverage_fov_scales_with_tangent() {
+        let base = LodPolicy::screen_coverage_fov(2.0, 40.0, LodPolicy::HALF_FOV_TAN);
+        assert!((base - LodPolicy::screen_coverage(2.0, 40.0)).abs() < 1e-7);
+        let narrow = LodPolicy::screen_coverage_fov(2.0, 40.0, LodPolicy::HALF_FOV_TAN / 2.0);
+        assert!((narrow - 2.0 * base).abs() < 1e-5);
     }
 }

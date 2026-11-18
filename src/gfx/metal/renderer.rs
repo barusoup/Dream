@@ -5,10 +5,12 @@ use super::metal::pipeline::{
 use super::metal::shader::{MslBindings, PUSH_CONSTANT_BUFFER_SLOT};
 use super::metal::swapchain::{PresentMode, Swapchain, SwapchainOptions};
 use super::{
-    ColorVertex, DEPTH_FORMAT, FramePhases, GpuBuffer, GpuContext, GpuImage, Renderer,
-    SCENE_FORMAT, SceneTargets, VELOCITY_FORMAT, ViewUniform,
+    ColorVertex, DEPTH_FORMAT, FramePhases, GpuBuffer, GpuContext, GpuImage, GpuPreference,
+    Renderer, SCENE_COLOR_FORMATS, SCENE_FORMAT, SURFACE_FORMAT, SceneTargets, VELOCITY_FORMAT,
+    ViewUniform,
 };
 use crate::fsr3::{Fsr3, JitterSequence};
+use crate::render::RenderSettings;
 use crate::settings::{AaMode, Settings};
 use crate::ui::render::UiBlend;
 use objc2_metal::{MTLCompareFunction, MTLPixelFormat, MTLTextureUsage, MTLVertexFormat};
@@ -76,6 +78,7 @@ fn build_targets(ctx: &Arc<GpuContext>, size: (u32, u32)) -> SceneTargets {
     SceneTargets {
         color: ctx.create_image("scene color", w, h, SCENE_FORMAT, color_usage),
         velocity: ctx.create_image("scene velocity", w, h, VELOCITY_FORMAT, color_usage),
+        surface: ctx.create_image("scene surface", w, h, SURFACE_FORMAT, color_usage),
         depth: ctx.create_image("scene depth", w, h, DEPTH_FORMAT, depth_usage),
     }
 }
@@ -116,7 +119,7 @@ impl Renderer {
         shader_src: &str,
         settings: Settings,
         blend: UiBlend,
-        _preference: crate::gfx::GpuPreference,
+        _preference: GpuPreference,
     ) -> Self {
         Self::new_inner(window, shader_src, None, settings, blend)
     }
@@ -193,7 +196,7 @@ impl Renderer {
             &scene_bindings,
             "vs_main",
             "fs_main",
-            &[SCENE_FORMAT, VELOCITY_FORMAT],
+            &SCENE_COLOR_FORMATS,
             Some(DEPTH_FORMAT),
             Some(&vertex_desc),
             false,
@@ -215,14 +218,17 @@ impl Renderer {
                 &pull_bindings,
                 "vs_main",
                 "fs_main",
-                &[SCENE_FORMAT, VELOCITY_FORMAT],
+                &SCENE_COLOR_FORMATS,
                 Some(DEPTH_FORMAT),
                 None,
                 false,
             )
         });
 
-        let blit_bindings = MslBindings::new().texture(0, 0, 0).sampler(0, 1, 0);
+        let blit_bindings = MslBindings::new()
+            .texture(0, 0, 0)
+            .sampler(0, 1, 0)
+            .push_constants(PUSH_CONSTANT_BUFFER_SLOT);
         let blit_fs = if ui_blend == UiBlend::Gamma {
             "fs_gamma"
         } else {
@@ -305,6 +311,10 @@ impl Renderer {
             last_frame: Instant::now(),
             phases: FramePhases::default(),
             frame_wait_budget: None,
+            aa_mode: settings.aa,
+            render_settings: RenderSettings::default(),
+            scene_time: 0.0,
+            scene_time_scale: 1.0,
         }
     }
 
@@ -364,9 +374,7 @@ impl Renderer {
         }
         self.ctx.wait_idle();
         if let Some(window) = self.ctx.window() {
-            self.ctx
-                .layer()
-                .setContentsScale(window.scale_factor().max(1.0));
+            self.ctx.layer().setContentsScale(window.scale_factor());
         }
         self.swapchain.resize(&self.ctx, size.width, size.height);
         self.display_size = (self.swapchain.width, self.swapchain.height);
@@ -545,5 +553,55 @@ impl Renderer {
 
     pub fn temporal(&self) -> bool {
         self.temporal
+    }
+
+    pub fn aa_mode(&self) -> AaMode {
+        self.aa_mode
+    }
+
+    pub fn set_aa_mode(&mut self, mode: AaMode) {
+        if self.aa_mode == mode {
+            return;
+        }
+        self.aa_mode = mode;
+        self.set_temporal(mode == AaMode::Fsr);
+    }
+
+    pub fn render_settings(&self) -> &RenderSettings {
+        &self.render_settings
+    }
+
+    pub fn set_render_settings(&mut self, settings: RenderSettings) {
+        self.render_settings = settings.sanitised();
+    }
+
+    pub fn ray_tracing_scene_mut(&mut self) -> Option<&mut super::RayTracingScene> {
+        None
+    }
+
+    pub fn clear_ray_tracing_scene(&mut self) {}
+
+    pub fn scene_time(&self) -> f64 {
+        self.scene_time
+    }
+
+    pub fn set_scene_time(&mut self, seconds: f64) {
+        self.scene_time = if seconds.is_finite() { seconds } else { 0.0 };
+    }
+
+    pub fn set_scene_time_scale(&mut self, scale: f32) {
+        self.scene_time_scale = if scale.is_finite() {
+            scale.clamp(0.0, 100.0)
+        } else {
+            1.0
+        };
+    }
+
+    pub fn occlusion(&self) -> Option<&crate::cull::OcclusionBuffer> {
+        None
+    }
+
+    pub fn pass_gpu_ms(&self) -> Vec<(&'static str, f32)> {
+        Vec::new()
     }
 }

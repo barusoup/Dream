@@ -1,6 +1,7 @@
 use super::vulkan;
 use super::{
-    DEPTH_FORMAT, GpuContext, GpuImage, SCENE_FORMAT, SceneTargets, SurfaceError, VELOCITY_FORMAT,
+    DEPTH_FORMAT, GpuContext, GpuImage, SCENE_FORMAT, SURFACE_FORMAT, SceneTargets, SurfaceError,
+    VELOCITY_FORMAT,
 };
 use ash::vk;
 use std::sync::Arc;
@@ -100,9 +101,17 @@ pub(super) fn depth_attachment(
     view: vk::ImageView,
     clear: f32,
 ) -> vk::RenderingAttachmentInfo<'static> {
+    depth_attachment_in(view, vk::ImageLayout::GENERAL, clear)
+}
+
+pub(super) fn depth_attachment_in(
+    view: vk::ImageView,
+    layout: vk::ImageLayout,
+    clear: f32,
+) -> vk::RenderingAttachmentInfo<'static> {
     vk::RenderingAttachmentInfo::default()
         .image_view(view)
-        .image_layout(vk::ImageLayout::GENERAL)
+        .image_layout(layout)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
         .clear_value(vk::ClearValue {
@@ -245,9 +254,10 @@ pub(super) fn create_graphics_pipeline_fs(
     }
     // Vulkan requires one blend-state entry per colour attachment. Supplying
     // fewer leaves the extra attachments' write mask undefined: the scene pass
-    // writes motion vectors into attachment 1, and a missing entry there means
-    // the velocity target is never written (upscalers then reproject as if
-    // nothing moved: clean while static, smeared on any camera motion).
+    // writes motion vectors into attachment 1 and surface data into attachment
+    // 2, and a missing entry there means that target is never written (upscalers
+    // then reproject as if nothing moved: clean while static, smeared on any
+    // camera motion).
     let color_blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = color_formats
         .iter()
         .map(|_| {
@@ -288,19 +298,21 @@ pub(super) fn create_graphics_pipeline_fs(
 
 pub(super) fn create_descriptor_pool(ctx: &GpuContext, slots: usize) -> vk::DescriptorPool {
     let n = slots as u32;
+    // Per slot: one scene set (uniform) and one blit set (sampled + sampler);
+    // plus the present set (sampled + sampler).
     let sizes = [
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(n),
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLED_IMAGE)
-            .descriptor_count(2),
+            .descriptor_count(n + 2),
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLER)
-            .descriptor_count(2),
+            .descriptor_count(n + 2),
     ];
     let info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(n + 2)
+        .max_sets(2 * n + 2)
         .pool_sizes(&sizes);
     unsafe { ctx.device().create_descriptor_pool(&info, None) }.expect("create descriptor pool")
 }
@@ -311,14 +323,21 @@ pub(super) fn allocate_sets(
     pool: vk::DescriptorPool,
     scene_dsl: &vk::DescriptorSetLayout,
     blit_dsl: &vk::DescriptorSetLayout,
-) -> (Vec<vk::DescriptorSet>, vk::DescriptorSet, vk::DescriptorSet) {
+) -> (
+    Vec<vk::DescriptorSet>,
+    Vec<vk::DescriptorSet>,
+    vk::DescriptorSet,
+) {
+    let slots = ctx.max_frames_in_flight();
     let mut layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
-    for _ in 0..ctx.max_frames_in_flight() {
+    for _ in 0..slots {
         layouts.push(*scene_dsl);
     }
-    // Blit source and present source share the sampled-image + sampler set.
-    layouts.push(*blit_dsl);
-    layouts.push(*blit_dsl);
+    // One blit set per slot, then the present set; both use the
+    // sampled-image + sampler layout.
+    for _ in 0..=slots {
+        layouts.push(*blit_dsl);
+    }
     let sets = unsafe {
         ctx.device().allocate_descriptor_sets(
             &vk::DescriptorSetAllocateInfo::default()
@@ -327,8 +346,9 @@ pub(super) fn allocate_sets(
         )
     }
     .expect("allocate descriptor sets");
-    let (scene_sets, tail) = sets.split_at(ctx.max_frames_in_flight());
-    (scene_sets.to_vec(), tail[0], tail[1])
+    let (scene_sets, tail) = sets.split_at(slots);
+    let (blit_sets, present) = tail.split_at(slots);
+    (scene_sets.to_vec(), blit_sets.to_vec(), present[0])
 }
 
 pub(super) fn sampled(view: vk::ImageView) -> vk::DescriptorImageInfo {
@@ -501,11 +521,13 @@ pub(super) fn build_targets(ctx: &Arc<GpuContext>, render_size: (u32, u32)) -> S
 
     let color = ctx.create_image("scene color", w, h, SCENE_FORMAT, color_usage);
     let velocity = ctx.create_image("velocity", w, h, VELOCITY_FORMAT, color_usage);
+    let surface = ctx.create_image("surface", w, h, SURFACE_FORMAT, color_usage);
     let depth = ctx.create_image("scene depth", w, h, DEPTH_FORMAT, depth_usage);
 
     let images = [
         (color.image, vk::ImageAspectFlags::COLOR),
         (velocity.image, vk::ImageAspectFlags::COLOR),
+        (surface.image, vk::ImageAspectFlags::COLOR),
         (depth.image, vk::ImageAspectFlags::DEPTH),
     ];
     ctx.one_shot(|cmd| unsafe {
@@ -543,7 +565,113 @@ pub(super) fn build_targets(ctx: &Arc<GpuContext>, render_size: (u32, u32)) -> S
     SceneTargets {
         color,
         velocity,
+        surface,
         depth,
+    }
+}
+
+/// Depth-only pipeline for sun shadow passes: no colour attachments, no culling
+/// (casters are seen from both sides), `LESS_OR_EQUAL` depth writes, dynamic
+/// depth bias (set per pass from the shadow settings) and depth clamp when the
+/// device enabled it. `fragment_entry` of `None` builds a vertex-only pipeline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_shadow_pipeline(
+    ctx: &GpuContext,
+    shader: vk::ShaderModule,
+    vertex_entry: &std::ffi::CStr,
+    vertex_bindings: &[vk::VertexInputBindingDescription],
+    vertex_attrs: &[vk::VertexInputAttributeDescription],
+    layout: vk::PipelineLayout,
+    depth_format: vk::Format,
+    fragment_entry: Option<&std::ffi::CStr>,
+) -> vk::Pipeline {
+    create_shadow_pipeline_cull(
+        ctx,
+        shader,
+        vertex_entry,
+        vertex_bindings,
+        vertex_attrs,
+        layout,
+        depth_format,
+        fragment_entry,
+        vk::CullModeFlags::NONE,
+    )
+}
+
+/// [`create_shadow_pipeline`] with an explicit face-cull mode.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_shadow_pipeline_cull(
+    ctx: &GpuContext,
+    shader: vk::ShaderModule,
+    vertex_entry: &std::ffi::CStr,
+    vertex_bindings: &[vk::VertexInputBindingDescription],
+    vertex_attrs: &[vk::VertexInputAttributeDescription],
+    layout: vk::PipelineLayout,
+    depth_format: vk::Format,
+    fragment_entry: Option<&std::ffi::CStr>,
+    cull: vk::CullModeFlags,
+) -> vk::Pipeline {
+    let mut stages = vec![
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(shader)
+            .name(vertex_entry),
+    ];
+    if let Some(entry) = fragment_entry {
+        stages.push(
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(shader)
+                .name(entry),
+        );
+    }
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(vertex_bindings)
+        .vertex_attribute_descriptions(vertex_attrs);
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let raster = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(cull)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .depth_bias_enable(true)
+        .depth_clamp_enable(ctx.depth_clamp())
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_state = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
+    let dynamic_states = [
+        vk::DynamicState::VIEWPORT,
+        vk::DynamicState::SCISSOR,
+        vk::DynamicState::DEPTH_BIAS,
+    ];
+    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let mut rendering =
+        vk::PipelineRenderingCreateInfo::default().depth_attachment_format(depth_format);
+    let info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&raster)
+        .multisample_state(&multisample)
+        .depth_stencil_state(&depth_state)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic)
+        .layout(layout)
+        .push_next(&mut rendering);
+    unsafe {
+        ctx.device()
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+            .map_err(|(_, err)| err)
+            .expect("create shadow pipeline")[0]
     }
 }
 

@@ -8,6 +8,9 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // Track directory membership as well as current shader files so newly
+    // added WGSL passes are validated on the next build.
+    println!("cargo:rerun-if-changed=src");
     let mut failed = false;
     let entries = wgsl_files("src");
 
@@ -21,6 +24,13 @@ fn main() {
     // PBR shaders get the shared lighting module prepended at load; validate
     // them the same way here.
     let lighting = std::fs::read_to_string("src/lighting/lighting.wgsl").unwrap_or_default();
+    // Atmosphere and fog passes (`atmo_*`, `fog_*`) each get their family's
+    // common maths prepended, at load and here.
+    let atmo_common = std::fs::read_to_string("src/gfx/atmo_common.wgsl").unwrap_or_default();
+    let fog_common = std::fs::read_to_string("src/gfx/fog_common.wgsl").unwrap_or_default();
+    // Cloud passes (`cloud_*`) get the atmosphere and cloud maths; the sky
+    // environment map also composites the cloud panorama, so it takes them too.
+    let cloud_common = std::fs::read_to_string("src/gfx/cloud_common.wgsl").unwrap_or_default();
     let spv_options = naga::back::spv::Options {
         flags: naga::back::spv::Options::default()
             .flags
@@ -68,6 +78,38 @@ fn main() {
             if name.starts_with("fsr3_") && name != "fsr3_common.wgsl" {
                 s = format!(
                     "{p_pre}
+{s}"
+                );
+            }
+            if name.starts_with("atmo_") && name != "atmo_common.wgsl" {
+                s = format!(
+                    "{atmo_common}
+{s}"
+                );
+            }
+            if name.starts_with("fog_") && name != "fog_common.wgsl" {
+                s = format!(
+                    "{fog_common}
+{s}"
+                );
+            }
+            if name.starts_with("cloud_") && name != "cloud_common.wgsl" {
+                s = format!(
+                    "{atmo_common}
+{cloud_common}
+{s}"
+                );
+            }
+            // The cloud march core uses the atmosphere's types and transmittance.
+            if name == "cloud_common.wgsl" {
+                s = format!(
+                    "{atmo_common}
+{s}"
+                );
+            }
+            if name == "atmo_envmap.wgsl" {
+                s = format!(
+                    "{cloud_common}
 {s}"
                 );
             }

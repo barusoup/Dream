@@ -104,12 +104,20 @@ impl GpuContext {
 
     /// Upload vertex data once into a device-local buffer.
     pub fn create_vertex_buffer(self: &Arc<Self>, label: &str, data: &[u8]) -> GpuBuffer {
-        self.upload_buffer(label, data, vk::BufferUsageFlags::VERTEX_BUFFER)
+        self.upload_buffer(
+            label,
+            data,
+            vk::BufferUsageFlags::VERTEX_BUFFER | self.rt_geometry_usage(),
+        )
     }
 
     /// Upload index data once into a device-local buffer.
     pub fn create_index_buffer(self: &Arc<Self>, label: &str, data: &[u8]) -> GpuBuffer {
-        self.upload_buffer(label, data, vk::BufferUsageFlags::INDEX_BUFFER)
+        self.upload_buffer(
+            label,
+            data,
+            vk::BufferUsageFlags::INDEX_BUFFER | self.rt_geometry_usage(),
+        )
     }
 
     /// Device-local buffer written and read through storage bindings.
@@ -141,6 +149,31 @@ impl GpuContext {
         usage: vk::BufferUsageFlags,
     ) -> GpuBuffer {
         self.create_buffer_inner(label, size, usage, MemoryLocation::GpuOnly)
+    }
+
+    /// A buffer with a caller-chosen usage mask for ray tracing (acceleration
+    /// structure storage, build inputs, scratch): device-local, or host-visible
+    /// and refilled by the CPU when `host_visible`.
+    pub(crate) fn create_rt_buffer(
+        self: &Arc<Self>,
+        label: &str,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        host_visible: bool,
+    ) -> GpuBuffer {
+        let location = if host_visible {
+            MemoryLocation::CpuToGpu
+        } else {
+            MemoryLocation::GpuOnly
+        };
+        self.create_buffer_inner(label, size, usage, location)
+    }
+
+    /// Device address of `buffer`, which must have been created with
+    /// `SHADER_DEVICE_ADDRESS` usage.
+    pub(crate) fn buffer_address(&self, buffer: vk::Buffer) -> u64 {
+        let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
+        unsafe { self.device.get_buffer_device_address(&info) }
     }
 
     /// A host-visible buffer a shader reads through a storage binding and the
@@ -346,12 +379,38 @@ impl GpuContext {
             ImageSpec {
                 width,
                 height,
+                depth: 1,
                 format,
                 usage,
                 array_layers,
                 mip_levels,
                 swizzle: vk::ComponentMapping::default(),
                 view_type: vk::ImageViewType::TYPE_2D_ARRAY,
+            },
+        )
+    }
+
+    /// A single-mip 3D image (`width` x `height` x `depth` texels), for the fog
+    /// volume. Only the aspect-colour view is created.
+    pub(crate) fn create_volume(
+        self: &Arc<Self>,
+        label: &str,
+        (width, height, depth): (u32, u32, u32),
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> GpuImage {
+        self.create_image_impl(
+            label,
+            ImageSpec {
+                width,
+                height,
+                depth,
+                format,
+                usage,
+                array_layers: 1,
+                mip_levels: 1,
+                swizzle: vk::ComponentMapping::default(),
+                view_type: vk::ImageViewType::TYPE_3D,
             },
         )
     }
@@ -373,6 +432,7 @@ impl GpuContext {
             ImageSpec {
                 width,
                 height,
+                depth: 1,
                 format,
                 usage,
                 array_layers: 1,
@@ -387,6 +447,7 @@ impl GpuContext {
         let ImageSpec {
             width,
             height,
+            depth,
             format,
             usage,
             array_layers,
@@ -394,13 +455,18 @@ impl GpuContext {
             swizzle,
             view_type,
         } = spec;
+        let is_volume = view_type == vk::ImageViewType::TYPE_3D;
         let info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
+            .image_type(if is_volume {
+                vk::ImageType::TYPE_3D
+            } else {
+                vk::ImageType::TYPE_2D
+            })
             .format(format)
             .extent(vk::Extent3D {
                 width: width.max(1),
                 height: height.max(1),
-                depth: 1,
+                depth: depth.max(1),
             })
             .mip_levels(mip_levels.max(1))
             .array_layers(array_layers.max(1))
@@ -496,6 +562,8 @@ impl GpuContext {
 struct ImageSpec {
     width: u32,
     height: u32,
+    /// Depth in texels; 1 for 2D images.
+    depth: u32,
     format: vk::Format,
     usage: vk::ImageUsageFlags,
     array_layers: u32,

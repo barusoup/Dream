@@ -1,7 +1,7 @@
 // Model forward pass: static and skinned meshes with per-object motion
 // vectors.
 //
-// Contract (matches terrain.wgsl / packed.wgsl so FSR reprojects every
+// Contract (matches model_pbr.wgsl and impostor.wgsl so FSR reprojects every
 // scene-pass target uniformly):
 // - set 0 is the engine camera block: jittered view_projection for the
 //   rendered position, unjittered curr/prev for motion.
@@ -48,10 +48,24 @@ struct VertexOutput {
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) velocity: vec2<f32>,
+    @location(2) surface: vec4<f32>,
 };
 
-// Texture-space uv of the offscreen targets; see terrain.wgsl for why the
-// sign is what it is.
+// Same encoding as `surface_encode` in lighting.wgsl (SURFACE_FORMAT). Inlined
+// because this shader does not compose the lighting module.
+fn simple_surface_encode(n: vec3<f32>, roughness: f32, metallic: f32) -> vec4<f32> {
+    let a = abs(n.x) + abs(n.y) + abs(n.z);
+    var o = n.xz / max(a, 1e-6);
+    if n.y < 0.0 {
+        let s = vec2<f32>(select(-1.0, 1.0, o.x >= 0.0), select(-1.0, 1.0, o.y >= 0.0));
+        o = (vec2<f32>(1.0) - abs(o.yx)) * s;
+    }
+    return vec4<f32>(o * 0.5 + 0.5, clamp(roughness, 0.0, 1.0), select(1.0, 0.6667, metallic > 0.5));
+}
+
+// Texture-space uv of the offscreen targets. The sign follows the FSR
+// texture-space motion contract described in the `crate::model::render`
+// module docs.
 fn screen_uv(ndc: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * 0.5 + 0.5);
 }
@@ -121,5 +135,6 @@ fn fs_main(input: VertexOutput) -> FragmentOutput {
     let diffuse = 0.65 + 0.35 * max(dot(n, light), 0.0);
     output.color = vec4<f32>(base.rgb * draw_data.base_color.rgb * diffuse, base.a * draw_data.base_color.a);
     output.velocity = input.velocity;
+    output.surface = simple_surface_encode(n, 0.9, 0.0);
     return output;
 }

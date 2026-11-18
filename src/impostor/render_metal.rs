@@ -151,9 +151,14 @@ impl ImpostorInstance {
     }
 }
 
+/// Default screen-space pixel threshold where impostor rendering switches to the
+/// far path (one view, no march). See [`ImpostorRenderer::far_px`].
+pub const DEFAULT_FAR_PX: f32 = 64.0;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct AssetParams {
+    far: [f32; 4],
     box_min: [f32; 4],
     box_max: [f32; 4],
     params: [f32; 4],
@@ -217,6 +222,7 @@ pub struct ImpostorRenderer {
     draws: u64,
     instances: u64,
     pub grad_scale: f32,
+    pub far_px: f32,
 }
 
 impl ImpostorRenderer {
@@ -247,8 +253,8 @@ impl ImpostorRenderer {
             .texture(2, 12, 9)
             .sampler(2, 13, 1)
             .buffer(2, 14, 4, false)
-            // @group(3): lighting_env
-            .buffer(3, 0, 5, false);
+            // @group(3): lighting_env + shadow/lighting textures/samplers
+            .lighting_group3(5, 10, 2);
 
         let src = format!(
             "{}\n{}",
@@ -303,6 +309,7 @@ impl ImpostorRenderer {
             draws: 0,
             instances: 0,
             grad_scale: 0.5,
+            far_px: DEFAULT_FAR_PX,
         }
     }
 
@@ -417,7 +424,14 @@ impl ImpostorRenderer {
                     .push(std::mem::replace(&mut slot.params_buffer, grown));
                 slot.params_capacity *= 2;
             }
-            let params = asset_params(asset, self.grad_scale, screen_px, fov_tan, debug);
+            let params = asset_params(
+                asset,
+                self.grad_scale,
+                self.far_px,
+                screen_px,
+                fov_tan,
+                debug,
+            );
             slot.params_buffer
                 .write_bytes(params_offset, bytemuck::bytes_of(&params));
             slot.params_used = params_offset + params_entry;
@@ -425,7 +439,6 @@ impl ImpostorRenderer {
         };
 
         let cam_buf = ctx.scene_uniform_buffer();
-        let lighting_buf = lighting.buffer(frame_slot);
         let enc = ctx.raw();
         enc.setRenderPipelineState(&self.pipeline);
         enc.setDepthStencilState(Some(&self.depth_stencil));
@@ -458,7 +471,7 @@ impl ImpostorRenderer {
             );
             enc.setFragmentBuffer_offset_atIndex(Some(&asset.voxels.buffer), 0, 3);
             enc.setFragmentBuffer_offset_atIndex(Some(&asset.material_table.buffer), 0, 4);
-            enc.setFragmentBuffer_offset_atIndex(Some(lighting_buf), 0, 5);
+            lighting.bind_fragment_group3(enc, frame_slot, 5, 10, 2);
 
             enc.setFragmentTexture_atIndex(Some(&asset.albedo.texture), 0);
             enc.setFragmentTexture_atIndex(Some(&asset.normal_ao.texture), 1);
@@ -528,6 +541,7 @@ pub(crate) fn source_geometry_enabled(has_mask_materials: bool, voxel_resolution
 fn asset_params(
     asset: &ImpostorAsset,
     grad: f32,
+    far_px: f32,
     screen_px: f32,
     fov_tan: f32,
     debug: AssetDebug,
@@ -539,7 +553,13 @@ fn asset_params(
         .enumerate()
         .map(|(i, v)| (*v as u32) << i)
         .sum();
+    let far_px = if far_px.is_finite() {
+        far_px.max(0.0)
+    } else {
+        0.0
+    };
     let mut params = AssetParams {
+        far: [far_px, 0.0, 0.0, 0.0],
         box_min: bounds.min.extend(0.0).to_array(),
         box_max: bounds.max.extend(0.0).to_array(),
         params: [

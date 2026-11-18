@@ -1,7 +1,8 @@
 use super::metal::shader::PUSH_CONSTANT_BUFFER_SLOT;
 use super::pipeline::{make_viewport, scene_region};
-use super::{DrawCtx, FramePhases, Renderer, SurfaceError, ViewUniform};
+use super::{DrawCtx, FramePhases, Renderer, SceneFrame, ScenePass, SurfaceError, ViewUniform};
 use crate::camera::Camera;
+use crate::render::Tonemap;
 use block2::RcBlock;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -13,10 +14,36 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BlitPush {
+    tonemap: u32,
+    exposure: f32,
+    dither: u32,
+    pad: u32,
+}
+
+impl BlitPush {
+    fn from_settings(settings: &crate::render::RenderSettings) -> Self {
+        let tonemap = match settings.tonemap {
+            Tonemap::None => 0,
+            Tonemap::Aces => 1,
+            Tonemap::AgX => 2,
+            Tonemap::Neutral => 3,
+        };
+        Self {
+            tonemap,
+            exposure: settings.exposure,
+            dither: u32::from(settings.dither),
+            pad: 0,
+        }
+    }
+}
+
 impl Renderer {
     pub fn render<F>(&mut self, camera: &Camera, draw: F) -> Result<usize, SurfaceError>
     where
-        F: FnOnce(&mut DrawCtx<'_>) -> usize,
+        F: FnMut(&mut DrawCtx<'_>) -> usize,
     {
         self.render_inner(camera, None, draw, None, true)
     }
@@ -29,7 +56,7 @@ impl Renderer {
         ui: Option<&crate::ui::draw::UiFrame>,
     ) -> Result<usize, SurfaceError>
     where
-        F: FnOnce(&mut DrawCtx<'_>) -> usize,
+        F: FnMut(&mut DrawCtx<'_>) -> usize,
     {
         self.render_inner(camera, scene_rect, draw, ui, true)
     }
@@ -42,6 +69,21 @@ impl Renderer {
             .map(|_| ())
     }
 
+    pub fn render_scene<F>(
+        &mut self,
+        frame: &SceneFrame<'_>,
+        draw: F,
+    ) -> Result<usize, SurfaceError>
+    where
+        F: FnMut(&mut DrawCtx<'_>) -> usize,
+    {
+        let p = frame.camera.position;
+        let mut env = frame.env;
+        env.cam_pos = [p.x, p.y, p.z, 0.0];
+        frame.lighting.upload(self.frame, &env);
+        self.render_inner(frame.camera, frame.scene_rect, draw, frame.ui, true)
+    }
+
     fn render_inner<F>(
         &mut self,
         camera: &Camera,
@@ -51,7 +93,7 @@ impl Renderer {
         scene_enabled: bool,
     ) -> Result<usize, SurfaceError>
     where
-        F: FnOnce(&mut DrawCtx<'_>) -> usize,
+        F: FnMut(&mut DrawCtx<'_>) -> usize,
     {
         objc2::rc::autoreleasepool(|_| {
             self.render_inner_pooled(camera, scene_rect, draw, ui, scene_enabled)
@@ -62,12 +104,12 @@ impl Renderer {
         &mut self,
         camera: &Camera,
         scene_rect: Option<crate::ui::Rect>,
-        draw: F,
+        mut draw: F,
         ui: Option<&crate::ui::draw::UiFrame>,
         scene_enabled: bool,
     ) -> Result<usize, SurfaceError>
     where
-        F: FnOnce(&mut DrawCtx<'_>) -> usize,
+        F: FnMut(&mut DrawCtx<'_>) -> usize,
     {
         self.scene_sample = None;
         self.phases = FramePhases::default();
@@ -127,7 +169,7 @@ impl Renderer {
         self.last_frame = Instant::now();
         let reset = !self.history_valid;
 
-        if scene_enabled {
+        let scene_vp = if scene_enabled {
             self.ensure_scene_targets();
             let view_projection = camera.jittered_view_projection(
                 jp,
@@ -144,7 +186,10 @@ impl Renderer {
                 prev_view_projection: prev_view_projection.to_cols_array_2d(),
             };
             self.scene_uniforms[frame].write_bytes(0, bytemuck::bytes_of(&uniform));
-        }
+            view_projection
+        } else {
+            glam::Mat4::IDENTITY
+        };
 
         let cmd = self
             .ctx
@@ -187,6 +232,17 @@ impl Renderer {
                 alpha: 0.0,
             });
 
+            let c2 = unsafe { ca.objectAtIndexedSubscript(2) };
+            c2.setTexture(Some(&self.targets.surface.texture));
+            c2.setLoadAction(MTLLoadAction::Clear);
+            c2.setStoreAction(MTLStoreAction::Store);
+            c2.setClearColor(MTLClearColor {
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 0.0,
+            });
+
             let da = rpd.depthAttachment();
             da.setTexture(Some(&self.targets.depth.texture));
             da.setLoadAction(MTLLoadAction::Clear);
@@ -210,6 +266,9 @@ impl Renderer {
                 frame_slot: frame,
                 frame_id: self.frame_id,
                 starter: std::cell::RefCell::new(Some(&mut noop_starter)),
+                pass: ScenePass::Main,
+                view_proj: scene_vp,
+                has_transparent: false,
             };
             drawn = draw(&mut draw_ctx);
             enc.endEncoding();
@@ -268,9 +327,15 @@ impl Renderer {
             blit_enc.setScissorRect(blit_scissor);
             blit_enc.setRenderPipelineState(&self.blit_pipeline);
             blit_enc.setDepthStencilState(Some(&self.no_depth_stencil));
+            let blit_push = BlitPush::from_settings(&self.render_settings);
             unsafe {
                 blit_enc.setFragmentTexture_atIndex(Some(blit_src), 0);
                 blit_enc.setFragmentSamplerState_atIndex(Some(self.ctx.default_sampler()), 0);
+                blit_enc.setFragmentBytes_length_atIndex(
+                    NonNull::new_unchecked(bytemuck::bytes_of(&blit_push).as_ptr() as *mut _),
+                    std::mem::size_of::<BlitPush>(),
+                    PUSH_CONSTANT_BUFFER_SLOT as usize,
+                );
                 blit_enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
             }
             blit_enc.endEncoding();
@@ -382,6 +447,7 @@ impl Renderer {
 
         self.scene_recorded[frame] = scene_enabled;
         if scene_enabled {
+            self.scene_time += f64::from(dt) * f64::from(self.scene_time_scale);
             self.prev_view_projection = curr_view_projection;
             self.history_valid = true;
         } else {

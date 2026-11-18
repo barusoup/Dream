@@ -46,6 +46,59 @@ pub struct PbrVertex {
     pub tangent: [f32; 4],
 }
 
+/// One placement of a model in [`ModelRenderer::draw_pbr_instanced`]: the
+/// current model matrix and the previous frame's, which motion vectors need.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct InstanceTransform {
+    pub model: [[f32; 4]; 4],
+    pub prev_model: [[f32; 4]; 4],
+}
+
+impl InstanceTransform {
+    /// A placement at `model` that did not move last frame.
+    pub fn still(model: glam::Mat4) -> Self {
+        let m = model.to_cols_array_2d();
+        Self {
+            model: m,
+            prev_model: m,
+        }
+    }
+}
+
+fn pbr_push(
+    model: glam::Mat4,
+    prev_model: glam::Mat4,
+    debug_channel: u32,
+    dither: Option<f32>,
+) -> [u8; 144] {
+    let mut bytes = [0u8; 144];
+    bytes[..64].copy_from_slice(bytemuck::bytes_of(&model.to_cols_array_2d()));
+    bytes[64..128].copy_from_slice(bytemuck::bytes_of(&prev_model.to_cols_array_2d()));
+    bytes[128..132].copy_from_slice(&(debug_channel as f32).to_le_bytes());
+    let (threshold, flag) = match dither {
+        Some(mesh_weight) => (mesh_weight, 1.0f32),
+        None => (1.0, 0.0),
+    };
+    bytes[132..136].copy_from_slice(&threshold.to_le_bytes());
+    bytes[136..140].copy_from_slice(&flag.to_le_bytes());
+    bytes
+}
+
+fn sanitise_unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Fade {
+    Opacity(f32),
+    Dither(f32),
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct DrawHeader {
@@ -112,6 +165,13 @@ pub struct ModelGpu {
 }
 
 impl ModelGpu {
+    pub(crate) fn register_rt_meshes(
+        &self,
+        _scene: &mut crate::gfx::RayTracingScene,
+    ) -> Vec<Option<crate::gfx::RtMeshHandle>> {
+        Vec::new()
+    }
+
     pub fn upload(ctx: &Arc<GpuContext>, model: &Arc<Model>) -> Self {
         let mut meshes = Vec::with_capacity(model.meshes.len());
         for (i, mesh) in model.meshes.iter().enumerate() {
@@ -389,7 +449,7 @@ impl PbrState {
             .buffer(0, 0, 0, false)
             .buffer(1, 0, 1, false)
             .buffer(2, 0, 2, false)
-            .buffer(3, 0, 3, false)
+            .lighting_group3(3, 5, 5)
             .texture(2, 1, 0)
             .sampler(2, 2, 0)
             .texture(2, 3, 1)
@@ -789,14 +849,80 @@ impl ModelRenderer {
         lighting: &Lighting,
         opacity: f32,
     ) {
-        let opacity = if opacity.is_finite() {
-            opacity.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let opacity = sanitise_unit(opacity);
         if opacity <= 0.0 {
             return;
         }
+        let (model_matrix, prev_model) = instance.motion_matrices();
+        self.draw_pbr_matrices(
+            ctx,
+            model,
+            model_matrix,
+            prev_model,
+            lighting,
+            Fade::Opacity(opacity),
+        );
+    }
+
+    /// Draw `model` opaque, discarding fragments via `lod_dither` against `mesh_weight`.
+    pub fn draw_pbr_dithered(
+        &mut self,
+        ctx: &mut DrawCtx<'_>,
+        model: &mut ModelGpu,
+        instance: &ModelInstance,
+        lighting: &Lighting,
+        mesh_weight: f32,
+    ) {
+        let mesh_weight = sanitise_unit(mesh_weight);
+        if mesh_weight <= 0.0 {
+            return;
+        }
+        let (model_matrix, prev_model) = instance.motion_matrices();
+        self.draw_pbr_matrices(
+            ctx,
+            model,
+            model_matrix,
+            prev_model,
+            lighting,
+            Fade::Dither(mesh_weight),
+        );
+    }
+
+    /// Draw `model` once for each transform in `transforms`.
+    pub fn draw_pbr_instanced(
+        &mut self,
+        ctx: &mut DrawCtx<'_>,
+        model: &mut ModelGpu,
+        transforms: &[InstanceTransform],
+        lighting: &Lighting,
+    ) {
+        for transform in transforms {
+            let model_matrix = glam::Mat4::from_cols_array_2d(&transform.model);
+            let prev_model = glam::Mat4::from_cols_array_2d(&transform.prev_model);
+            self.draw_pbr_matrices(
+                ctx,
+                model,
+                model_matrix,
+                prev_model,
+                lighting,
+                Fade::Opacity(1.0),
+            );
+        }
+    }
+
+    fn draw_pbr_matrices(
+        &mut self,
+        ctx: &mut DrawCtx<'_>,
+        model: &mut ModelGpu,
+        model_matrix: glam::Mat4,
+        prev_model: glam::Mat4,
+        lighting: &Lighting,
+        fade: Fade,
+    ) {
+        let (opacity, dither) = match fade {
+            Fade::Opacity(opacity) => (opacity, None),
+            Fade::Dither(weight) => (1.0, Some(weight)),
+        };
         model.ensure_pbr();
         if self.pbr.is_none() {
             self.pbr = Some(PbrState::new(
@@ -808,8 +934,6 @@ impl ModelRenderer {
         let frame_slot = ctx.frame_slot();
         let ring_index = frame_slot % self.rings.len();
         self.recycle_slot(ring_index, ctx.frame_id());
-        let (model_matrix, prev_model) = instance.motion_matrices();
-        let lighting_buf = lighting.buffer(frame_slot);
 
         for mesh_index in 0..model.meshes.len() {
             let mesh = &model.meshes[mesh_index];
@@ -821,14 +945,12 @@ impl ModelRenderer {
             };
             let model_mat = model_matrix * mesh.node_transform;
             let prev_mat = prev_model * mesh.node_transform;
-            let mut push = [0u8; 144];
-            push[..64].copy_from_slice(bytemuck::bytes_of(&model_mat.to_cols_array_2d()));
-            push[64..128].copy_from_slice(bytemuck::bytes_of(&prev_mat.to_cols_array_2d()));
-            push[128..132].copy_from_slice(&(self.debug_channel as f32).to_le_bytes());
+            let push = pbr_push(model_mat, prev_mat, self.debug_channel, dither);
 
             let material_index = mesh.material;
             let material = &model.model().materials[material_index];
-            let blended = opacity < 1.0 || material.alpha_mode == AlphaMode::Blend;
+            let blended =
+                dither.is_none() && (opacity < 1.0 || material.alpha_mode == AlphaMode::Blend);
             let mut base_color = material.base_color;
             base_color[3] = opacity;
 
@@ -886,7 +1008,7 @@ impl ModelRenderer {
                     1,
                 );
                 enc.setFragmentBuffer_offset_atIndex(Some(&mat_gpu.factors.buffer), 0, 2);
-                enc.setFragmentBuffer_offset_atIndex(Some(lighting_buf), 0, 3);
+                lighting.bind_fragment_group3(enc, frame_slot, 3, 5, 5);
                 enc.setVertexBuffer_offset_atIndex(
                     Some(&pbr_vb.buffer),
                     0,
@@ -926,6 +1048,10 @@ impl ModelRenderer {
     }
 
     pub fn draws(&self) -> u64 {
+        self.draws
+    }
+
+    pub fn draw_calls(&self) -> u64 {
         self.draws
     }
 }

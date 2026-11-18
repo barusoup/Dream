@@ -21,7 +21,7 @@ struct Instance {
     model: mat4x4<f32>,
     prev_model: mat4x4<f32>,
     inv_model: mat4x4<f32>,
-    misc: vec4<f32>,     // alpha, -, -, -
+    misc: vec4<f32>,     // LoD crossfade impostor weight in [0,1] (dither threshold), -, -, -
 };
 
 struct Instances { items: array<Instance> };
@@ -44,6 +44,9 @@ struct Asset {
     v_axes: array<vec4<f32>, 26>,
     extents: array<vec4<f32>, 26>, // per-view ext_u, ext_v, ext_n, -
     views: array<vec4<f32>, 26>,   // per-view dir (points from model to camera side)
+    // x: projected diameter (px) below which the far path (one view, no march)
+    // is used; 0 disables it.
+    far: vec4<f32>,
 };
 @group(2) @binding(0) var<uniform> asset: Asset;
 @group(2) @binding(1) var t_albedo: texture_2d_array<f32>;
@@ -78,11 +81,14 @@ struct VertexOutput {
     @builtin(position) clip: vec4<f32>,
     @location(0) obj_pos: vec3<f32>,
     @location(1) @interpolate(flat) instance: u32,
+    // 1 when the instance takes the far path (decided per instance).
+    @location(2) @interpolate(flat) far: u32,
 };
 
 struct FragOutput {
     @location(0) color: vec4<f32>,
     @location(1) velocity: vec2<f32>,
+    @location(2) surface: vec4<f32>,
     @builtin(frag_depth) depth: f32,
 };
 
@@ -122,7 +128,23 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     out.clip = camera.view_projection * world;
     out.obj_pos = pos;
     out.instance = ii;
+    out.far = far_instance(ii);
     return out;
+}
+
+// The far path when the box's projected diameter is below `asset.far.x` pixels.
+// Pixels per world unit at distance d are 1 / (d * screen.y); the box diagonal
+// bounds the object, so the test is conservative for every shape.
+fn far_instance(ii: u32) -> u32 {
+    let m = instances.items[ii].model;
+    let scale = length(m[0].xyz);
+    let size = length(asset.box_max.xyz - asset.box_min.xyz) * scale;
+    let centre = (m * vec4<f32>((asset.box_min.xyz + asset.box_max.xyz) * 0.5, 1.0)).xyz;
+    // View depth of the centre (clip w), not a camera-position uniform: the
+    // vertex stage's copy of the camera position is not reliable here.
+    let dist = max((camera.view_projection * vec4<f32>(centre, 1.0)).w, 1e-3);
+    let px = size / max(dist * asset.screen.y, 1e-9);
+    return select(0u, 1u, asset.far.x > 0.0 && px < asset.far.x);
 }
 
 // ---------------------------------------------------------------- hull
@@ -1509,11 +1531,105 @@ fn projective_material(
     );
 }
 
+// ---------------------------------------------------------------- far path
+
+// The baked view whose outward direction faces the camera most, in object space.
+// Only the ray direction is needed: 26 dot products, no texture reads.
+fn far_view(rd: vec3<f32>) -> u32 {
+    var best = 0u;
+    var best_dot = -2.0;
+    for (var f = 0u; f < 26u; f = f + 1u) {
+        let d = dot(asset.views[f].xyz, -rd);
+        if d > best_dot {
+            best_dot = d;
+            best = f;
+        }
+    }
+    return best;
+}
+
+// Small instances: no ray march. The fragment's ray meets the chosen view's
+// stored surface at the depth that view holds (one depth tap, refined once at
+// the hit), then one tap per layer and one lighting evaluation. The same
+// surface, lighting and motion as the exact path, from a single baked view.
+fn fs_far(input: VertexOutput, inst: Instance) -> FragOutput {
+    let c = (asset.box_min.xyz + asset.box_max.xyz) * 0.5;
+    let ro = (inst.inv_model * vec4<f32>(lighting_env.cam_pos.xyz, 1.0)).xyz;
+    let rd = normalize(input.obj_pos - ro);
+    let f = far_view(rd);
+    let n_f = asset.views[f].xyz;
+    let e = asset.extents[f];
+    // Mip 0. A footprint-derived mip blurred the tile's alpha: the silhouette
+    // shrank and the far-path brightness drifted from the mesh (world_check
+    // check 7 at 60 m failed at mip > 0, passes at mip 0).
+    let lod = 0.0;
+    let res = asset.params.y;
+
+    // First depth tap at the card point, then the hit it implies on the ray.
+    let uv0 = face_uv(f, input.obj_pos, c);
+    let d0 = textureSampleLevel(t_depth, s_tile, uv0, i32(f), lod).r;
+    if d0 >= 1.0 {
+        discard;
+    }
+    let s = e.z * (0.5 - d0);
+    let denom = dot(rd, n_f);
+    if abs(denom) < 1e-4 {
+        discard;
+    }
+    let t = (s - dot(ro - c, n_f)) / denom;
+    if t <= 0.0 {
+        discard;
+    }
+    let hit = ro + rd * t;
+    let uv = face_uv(f, hit, c);
+    if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) {
+        discard;
+    }
+    let tex = sample_face_level(f, uv, lod);
+    if tex.albedo.a < asset.params.x {
+        discard;
+    }
+
+    let albedo = tex.albedo.rgb;
+    let n_obj = normalize(tex.normal_ao.xyz * 2.0 - vec3<f32>(1.0));
+    let rough = clamp(tex.mr.r, 0.03, 1.0);
+    let metal = clamp(tex.mr.g, 0.0, 1.0);
+    let ao = clamp(tex.normal_ao.a, 0.0, 1.0);
+    let rot = mat3x3<f32>(inst.model[0].xyz, inst.model[1].xyz, inst.model[2].xyz);
+    let n_world = normalize(rot * n_obj);
+    let world = (inst.model * vec4<f32>(hit, 1.0)).xyz;
+    let v = normalize(lighting_env.cam_pos.xyz - world);
+    let lit = lighting_eval(albedo, metal, rough, n_world, v, world, ao) + tex.emissive.rgb;
+
+    let clip_pos = camera.view_projection * vec4<f32>(world, 1.0);
+    let prev_world = (inst.prev_model * vec4<f32>(hit, 1.0)).xyz;
+    let curr_ndc = camera.curr_view_projection * vec4<f32>(world, 1.0);
+    let prev_ndc = camera.prev_view_projection * vec4<f32>(prev_world, 1.0);
+    var out: FragOutput;
+    out.color = vec4<f32>(lit, 1.0);
+    out.velocity = screen_uv(prev_ndc.xy / prev_ndc.w) - screen_uv(curr_ndc.xy / curr_ndc.w);
+    out.surface = surface_encode(n_world, rough, metal);
+    out.depth = clip_pos.z / clip_pos.w;
+    return out;
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> FragOutput {
+    lighting_begin(input.clip.xy);
     let inst = instances.items[input.instance];
     if inst.misc.x <= 0.0 {
         discard; // zero-opacity instance: no ray work
+    }
+    // LoD crossfade: the impostor keeps the pixels the mesh does not (the
+    // mesh keeps `t < mesh_weight`, i.e. the impostor `t >= 1 - impostor_weight`;
+    // see `lod_dither`). Decided before any ray work, so a pixel the mesh owns
+    // costs nothing here. `clip` is the `@builtin(position)` the model shader
+    // also hashes.
+    if lod_dither(input.clip.xy) < 1.0 - inst.misc.x {
+        discard;
+    }
+    if input.far != 0u && u32(asset.params.w) == 0u {
+        return fs_far(input, inst);
     }
     let c = (asset.box_min.xyz + asset.box_max.xyz) * 0.5;
 
@@ -1647,6 +1763,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         var out1: FragOutput;
         out1.color = vec4<f32>(1.0, 0.15, 0.1, 1.0);
         out1.velocity = vec2<f32>(0.0);
+        out1.surface = vec4<f32>(0.0);
         out1.depth = clip0.z / clip0.w;
         return out1;
     }
@@ -1771,6 +1888,11 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         var outc: FragOutput;
         outc.color = vec4<f32>(ch, 1.0);
         outc.velocity = vec2<f32>(0.0);
+        outc.surface = surface_encode(
+            normalize(mat3x3<f32>(inst.model[0].xyz, inst.model[1].xyz, inst.model[2].xyz) * n_obj_dbg),
+            rough,
+            metal,
+        );
         outc.depth = hit_depth;
         return outc;
     }
@@ -1779,6 +1901,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         var out2: FragOutput;
         out2.color = vec4<f32>(0.0, coverage, 0.0, 1.0);
         out2.velocity = vec2<f32>(0.0);
+        out2.surface = vec4<f32>(0.0);
         out2.depth = hit_depth;
         return out2;
     }
@@ -1786,6 +1909,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         var out3: FragOutput;
         out3.color = vec4<f32>(albedo, 1.0);
         out3.velocity = vec2<f32>(0.0);
+        out3.surface = vec4<f32>(0.0);
         out3.depth = hit_depth;
         return out3;
     }
@@ -1799,6 +1923,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         var out4: FragOutput;
         out4.color = vec4<f32>(n_world * 0.5 + vec3<f32>(0.5), 1.0);
         out4.velocity = vec2<f32>(0.0);
+        out4.surface = surface_encode(n_world, rough, metal);
         out4.depth = hit_depth;
         return out4;
     }
@@ -1806,6 +1931,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         var out5: FragOutput;
         out5.color = vec4<f32>(vec3<f32>((ray_box(ro, rd)).x * 0.1), 1.0);
         out5.velocity = vec2<f32>(0.0);
+        out5.surface = vec4<f32>(0.0);
         out5.depth = hit_depth;
         return out5;
     }
@@ -1813,6 +1939,7 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         var out6: FragOutput;
         out6.color = vec4<f32>(weights_dbg, 1.0);
         out6.velocity = vec2<f32>(0.0);
+        out6.surface = vec4<f32>(0.0);
         out6.depth = hit_depth;
         return out6;
     }
@@ -1821,16 +1948,15 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         var out8: FragOutput;
         out8.color = vec4<f32>(metal, rough, ao, 1.0);
         out8.velocity = vec2<f32>(0.0);
+        out8.surface = surface_encode(n_world, rough, metal);
         out8.depth = hit_depth;
         return out8;
     }
 
-    // Opaque/MASK-baked card: alpha is exactly the instance crossfade weight.
-    // Averaged projected coverage is NOT camera-space opacity — multiplying
-    // it in made fully-selected cards dither into transparency. The hull
-    // (depth sentinel) carries alpha-test holes; temporal AA handles the
-    // silhouette edge.
-    let alpha = clamp(inst.misc.x, 0.0, 1.0);
+    // Opaque output: the crossfade weight was spent on the dither discard
+    // above, not on alpha. Averaged projected coverage is NOT camera-space
+    // opacity either. The hull (depth sentinel) carries alpha-test holes;
+    // temporal AA handles the silhouette edge.
 
     // Shared lighting at the geometry world position: identical inputs to
     // model_pbr.wgsl -> colour parity with the mesh.
@@ -1843,8 +1969,9 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     }
 
     var out: FragOutput;
-    out.color = vec4<f32>(lit, alpha);
+    out.color = vec4<f32>(lit, 1.0);
     out.velocity = vel;
+    out.surface = surface_encode(n_world, rough, metal);
     out.depth = hit_depth;
     return out;
 }

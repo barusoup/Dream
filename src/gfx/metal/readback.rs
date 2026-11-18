@@ -96,6 +96,60 @@ impl Renderer {
         (bytes, w, h)
     }
 
+    /// Decode the scene surface target (`SURFACE_FORMAT`) to top-row-first RGBA8.
+    pub fn capture_surface_rgba8(&mut self) -> (Vec<u8>, u32, u32) {
+        self.ensure_scene_targets();
+        let (w, h) = self.render_size;
+        let raw =
+            self.read_texture_bytes(&self.targets.surface.texture, w, h, 4, "surface readback");
+        let mut out = vec![0u8; raw.len()];
+        for (dst, texel) in out.chunks_exact_mut(4).zip(raw.chunks_exact(4)) {
+            let packed = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
+            let scale10 = |shift: u32| (((packed >> shift) & 0x3ff) * 255 + 511) / 1023;
+            dst[0] = scale10(0) as u8;
+            dst[1] = scale10(10) as u8;
+            dst[2] = scale10(20) as u8;
+            dst[3] = ((packed >> 30) & 0x3) as u8 * 85;
+        }
+        (out, w, h)
+    }
+
+    pub fn capture_indirect_rgba8(&mut self) -> (Vec<u8>, u32, u32) {
+        (Vec::new(), 0, 0)
+    }
+
+    pub fn capture_reflection_rgba8(&mut self) -> (Vec<u8>, u32, u32) {
+        (Vec::new(), 0, 0)
+    }
+
+    pub fn capture_sky_env_rgba16f(&mut self) -> (Vec<f32>, u32, u32) {
+        (Vec::new(), 0, 0)
+    }
+
+    pub fn capture_sky_view_rgba16f(&mut self) -> (Vec<f32>, u32, u32) {
+        (Vec::new(), 0, 0)
+    }
+
+    pub fn capture_fog_volume(&mut self) -> Option<(Vec<f32>, (u32, u32, u32))> {
+        None
+    }
+
+    pub fn capture_fog_injected(&mut self) -> Option<(Vec<f32>, (u32, u32, u32))> {
+        None
+    }
+
+    pub fn capture_cloud_panorama(&mut self) -> Option<(Vec<f32>, u32, u32)> {
+        None
+    }
+
+    pub fn shadow_gpu_ms(&self) -> f32 {
+        0.0
+    }
+
+    pub fn post_gpu_ms(&self) -> f32 {
+        0.0
+    }
+
     fn read_velocity_bytes(&mut self) -> Vec<u8> {
         self.ensure_scene_targets();
         let (rw, rh) = self.render_size;

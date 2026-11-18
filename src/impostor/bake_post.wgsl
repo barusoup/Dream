@@ -1,5 +1,5 @@
-// GPU post-bake: downsample / dilate / mipgen / pack over the six capture
-// layers. All buffers are layer-major (layer * res*res + y * res + x); the
+// GPU post-bake: downsample / dilate / mipgen / pack over the capture
+// layers (`VIEW_COUNT` views, one array layer each). All buffers are layer-major (layer * res*res + y * res + x); the
 // depth channel stores one f32 per texel with 1.0 = uncovered sentinel.
 
 struct DParams {

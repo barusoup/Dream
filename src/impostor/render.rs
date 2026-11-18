@@ -5,9 +5,10 @@
 //! expands each instance into a 12-triangle bounding-box shell, and the
 //! fragment shader resolves geometry (source-triangle DDA for opaque
 //! assets, visual-hull march otherwise) + projective shading, with exact
-//! source-triangle material evaluation at subpixel range. Color blends (for
-//! LoD crossfade); the velocity attachment stays unblended, matching the
-//! model pipelines' contract.
+//! source-triangle material evaluation at subpixel range. A LoD crossfade is
+//! dithered (`lod_dither`) rather than blended: every fragment writes alpha 1,
+//! and the velocity attachment stays unblended, matching the model pipelines'
+//! contract.
 
 use super::atlas::{AssetDebug, ImpostorAsset};
 use super::{ImpostorBounds, VIEWS, projected_extent};
@@ -115,14 +116,15 @@ fn check_transform(m: &[[f32; 4]; 4]) -> Result<(), ImpostorInstanceError> {
 }
 
 /// One card instance: model + prev model for motion vectors, inverse model
-/// for the object-space view ray, alpha for the crossfade weight.
+/// for the object-space view ray, and the crossfade weight (`misc[0]`), which
+/// the shader turns into a per-pixel dither threshold.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ImpostorInstance {
     pub model: [[f32; 4]; 4],
     pub prev_model: [[f32; 4]; 4],
     pub inv_model: [[f32; 4]; 4],
-    pub misc: [f32; 4], // alpha, -, -, -
+    pub misc: [f32; 4], // crossfade impostor weight, -, -, -
 }
 
 impl ImpostorInstance {
@@ -178,6 +180,10 @@ impl ImpostorInstance {
     }
 }
 
+/// Default projected diameter, in pixels, below which an impostor takes the
+/// far path (one view, no march). See [`ImpostorRenderer::far_px`].
+pub const DEFAULT_FAR_PX: f32 = 64.0;
+
 /// Asset params uniform, mirroring `Asset` in impostor.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -191,6 +197,9 @@ struct AssetParams {
     v_axes: [[f32; 4]; super::VIEW_COUNT],
     extents: [[f32; 4]; super::VIEW_COUNT],
     views: [[f32; 4]; super::VIEW_COUNT],
+    // x: projected diameter in pixels below which the far path (no march) is
+    // used; 0 disables it. yzw unused.
+    far: [f32; 4],
 }
 
 // All fields are f32/arrays of f32; the layout is dense with no padding.
@@ -269,6 +278,9 @@ pub struct ImpostorRenderer {
     instances: u64,
     /// Mip-gradient scale factor (0.5 = half-footprint); see impostor.wgsl.
     pub grad_scale: f32,
+    /// Projected diameter (pixels) below which an instance takes the far path:
+    /// one view, no ray march. 0 disables the far path. See impostor.wgsl.
+    pub far_px: f32,
 }
 
 impl ImpostorRenderer {
@@ -476,6 +488,7 @@ impl ImpostorRenderer {
             draws: 0,
             instances: 0,
             grad_scale: 0.35,
+            far_px: DEFAULT_FAR_PX,
         }
     }
 
@@ -510,6 +523,10 @@ impl ImpostorRenderer {
     /// Validating version of [`Self::draw`]: every contract failure returns
     /// an [`ImpostorDrawError`] instead of panicking or producing invalid
     /// Vulkan state.
+    ///
+    /// Impostors receive sun shadows but do not cast them yet: in a shadow
+    /// pass (see [`DrawCtx::is_shadow_pass`]) this returns `Ok(())` without
+    /// recording anything.
     pub fn try_draw(
         &mut self,
         ctx: &mut DrawCtx<'_>,
@@ -520,6 +537,9 @@ impl ImpostorRenderer {
         fov_tan: f32,
         debug: AssetDebug,
     ) -> Result<(), ImpostorDrawError> {
+        if ctx.is_shadow_pass() {
+            return Ok(());
+        }
         if !screen_px.is_finite()
             || screen_px <= 0.0
             || !fov_tan.is_finite()
@@ -614,7 +634,14 @@ impl ImpostorRenderer {
                     .push(std::mem::replace(&mut slot.params_buffer, grown));
                 slot.params_capacity *= 2;
             }
-            let params = asset_params(asset, self.grad_scale, screen_px, fov_tan, debug);
+            let params = asset_params(
+                asset,
+                self.grad_scale,
+                self.far_px,
+                screen_px,
+                fov_tan,
+                debug,
+            );
             slot.params_buffer
                 .write(params_offset, bytemuck::bytes_of(&params));
             slot.params_used = params_offset + params_entry;
@@ -909,6 +936,7 @@ fn source_geometry_enabled(has_mask_materials: bool, voxel_resolution: u32) -> b
 fn asset_params(
     asset: &ImpostorAsset,
     grad: f32,
+    far_px: f32,
     screen_px: f32,
     fov_tan: f32,
     debug: AssetDebug,
@@ -920,7 +948,13 @@ fn asset_params(
         .enumerate()
         .map(|(i, v)| (*v as u32) << i)
         .sum();
+    let far_px = if far_px.is_finite() {
+        far_px.max(0.0)
+    } else {
+        0.0
+    };
     let mut params = AssetParams {
+        far: [far_px, 0.0, 0.0, 0.0],
         box_min: bounds.min.extend(0.0).to_array(),
         box_max: bounds.max.extend(0.0).to_array(),
         params: [
@@ -1003,7 +1037,8 @@ fn create_impostor_pipeline(
         .depth_test_enable(true)
         .depth_write_enable(true)
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
-    // Colour blends for the crossfade; velocity must not blend (same contract
+    // Colour blend state is unchanged: the fragment writes alpha 1, so the
+    // blend is an exact pass-through. Velocity must not blend (same contract
     // as the model pipelines' blended variants).
     let blend_attachments: Vec<_> = color_formats
         .iter()
@@ -1062,10 +1097,10 @@ mod tests {
     fn instance_layout_matches_wgsl() {
         // mat4 x3 + vec4 = 3*64 + 16.
         assert_eq!(std::mem::size_of::<ImpostorInstance>(), 208);
-        // 2 box + params + screen + material + 4 view arrays of 26 vec4.
+        // 2 box + params + screen + material + far + 4 view arrays of 26 vec4.
         assert_eq!(
             std::mem::size_of::<AssetParams>(),
-            (5 + 4 * crate::impostor::VIEW_COUNT) * 16
+            (6 + 4 * crate::impostor::VIEW_COUNT) * 16
         );
     }
 

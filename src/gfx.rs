@@ -12,10 +12,28 @@
 
 #[cfg(not(target_os = "macos"))]
 mod acquire;
+#[cfg(not(target_os = "macos"))]
+mod atmosphere;
+#[cfg(not(target_os = "macos"))]
+mod cloud_shadow;
+#[cfg(not(target_os = "macos"))]
+mod cloud_view;
+#[cfg(not(target_os = "macos"))]
+mod clouds;
 #[cfg_attr(target_os = "macos", path = "gfx/metal/draw.rs")]
 mod draw;
+#[cfg(not(target_os = "macos"))]
+mod fog;
 #[cfg_attr(target_os = "macos", path = "gfx/metal/frame.rs")]
 mod frame;
+#[cfg(not(target_os = "macos"))]
+mod hiz;
+#[cfg(not(target_os = "macos"))]
+mod indirect;
+#[cfg(not(target_os = "macos"))]
+mod linear_depth;
+#[cfg(not(target_os = "macos"))]
+mod pass_timer;
 #[cfg(not(target_os = "macos"))]
 mod pipeline;
 pub mod present;
@@ -23,11 +41,24 @@ pub mod present;
 use metal::pipeline;
 #[cfg(target_os = "macos")]
 pub mod metal;
+#[cfg(not(target_os = "macos"))]
+mod post;
 #[cfg_attr(target_os = "macos", path = "gfx/metal/readback.rs")]
 mod readback;
+#[cfg(not(target_os = "macos"))]
+mod reflection;
 #[cfg_attr(target_os = "macos", path = "gfx/metal/renderer.rs")]
 pub(crate) mod renderer;
+#[cfg(not(target_os = "macos"))]
+mod rt;
+#[cfg(not(target_os = "macos"))]
 mod shader;
+#[cfg(not(target_os = "macos"))]
+mod shadow;
+#[cfg(not(target_os = "macos"))]
+mod sky_frame;
+#[cfg(not(target_os = "macos"))]
+mod taa;
 #[cfg_attr(target_os = "macos", path = "gfx/metal/thumbnail.rs")]
 mod thumbnail;
 #[cfg(not(target_os = "macos"))]
@@ -39,11 +70,19 @@ pub mod vulkan;
 pub(crate) use metal::align_up;
 #[cfg(target_os = "macos")]
 pub use metal::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh};
+#[cfg(not(target_os = "macos"))]
+pub(crate) use pipeline::{create_shadow_pipeline, create_shadow_pipeline_cull};
 pub use present::{GpuPreference, PresentMode};
+#[cfg(not(target_os = "macos"))]
+pub use rt::{RayTracingScene, RtInstance, RtMaterial, RtMeshHandle};
 #[cfg(not(target_os = "macos"))]
 pub use vulkan::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh};
 
+use crate::camera::Camera;
 use crate::fsr3::{Fsr3, JitterSequence};
+use crate::lighting::{Lighting, LightingEnv};
+use crate::render::RenderSettings;
+use crate::settings::AaMode;
 #[cfg(not(target_os = "macos"))]
 use ash::vk;
 use std::sync::Arc;
@@ -55,6 +94,21 @@ pub const SCENE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 #[cfg(not(target_os = "macos"))]
 pub const VELOCITY_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
+/// Per-pixel surface data for later lighting passes (AO, GI, reflections).
+///
+/// Encoding, written by the scene fragment shaders:
+/// - `rg`: octahedral-encoded world-space unit normal, remapped to 0..1.
+/// - `b`: perceptual roughness.
+/// - `a`: surface class. 0 = no surface data (sky, unlit debug geometry);
+///   1 = dielectric surface; 2/3 = metallic surface (metallic > 0.5).
+///
+/// Cleared to all zero at the start of each scene pass.
+#[cfg(not(target_os = "macos"))]
+pub const SURFACE_FORMAT: vk::Format = vk::Format::A2B10G10R10_UNORM_PACK32;
+/// Colour attachment formats of the scene pass, in attachment order:
+/// scene colour, motion vectors, surface data (see [`SURFACE_FORMAT`]).
+#[cfg(not(target_os = "macos"))]
+pub const SCENE_COLOR_FORMATS: [vk::Format; 3] = [SCENE_FORMAT, VELOCITY_FORMAT, SURFACE_FORMAT];
 
 #[cfg(target_os = "macos")]
 pub const SCENE_FORMAT: metal::PixelFormat = metal::PixelFormat::RGBA16Float;
@@ -62,6 +116,70 @@ pub const SCENE_FORMAT: metal::PixelFormat = metal::PixelFormat::RGBA16Float;
 pub const DEPTH_FORMAT: metal::PixelFormat = metal::PixelFormat::Depth32Float;
 #[cfg(target_os = "macos")]
 pub const VELOCITY_FORMAT: metal::PixelFormat = metal::PixelFormat::RG16Float;
+#[cfg(target_os = "macos")]
+pub const SURFACE_FORMAT: metal::PixelFormat = metal::PixelFormat::RGB10A2Unorm;
+#[cfg(target_os = "macos")]
+pub const SCENE_COLOR_FORMATS: [metal::PixelFormat; 3] =
+    [SCENE_FORMAT, VELOCITY_FORMAT, SURFACE_FORMAT];
+
+/// Shading values of a mesh for hardware ray tracing.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RtMaterial {
+    pub base_color: [f32; 3],
+    pub roughness: f32,
+    pub emissive: [f32; 3],
+    pub metallic: f32,
+}
+
+#[cfg(target_os = "macos")]
+impl Default for RtMaterial {
+    fn default() -> Self {
+        Self {
+            base_color: [0.8, 0.8, 0.8],
+            roughness: 0.5,
+            emissive: [0.0; 3],
+            metallic: 0.0,
+        }
+    }
+}
+
+/// Handle of a mesh registered with [`RayTracingScene`].
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtMeshHandle {
+    _private: u32,
+}
+
+/// One placed copy of a registered mesh for hardware ray tracing.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RtInstance {
+    pub mesh: RtMeshHandle,
+    pub transform: glam::Mat4,
+}
+
+/// Hardware ray-tracing scene (unavailable on Metal; `Renderer::ray_tracing_scene_mut` returns `None`).
+#[cfg(target_os = "macos")]
+pub struct RayTracingScene;
+
+#[cfg(target_os = "macos")]
+impl RayTracingScene {
+    pub fn register_mesh(
+        &mut self,
+        _positions: &[[f32; 3]],
+        _indices: &[u32],
+        _material: RtMaterial,
+    ) -> Option<RtMeshHandle> {
+        None
+    }
+
+    pub fn set_instances(&mut self, _instances: &[RtInstance]) {}
+
+    pub fn id(&self) -> u64 {
+        0
+    }
+}
 
 /// Diagnostic counts of the shared texture objects of one [`GpuContext`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -183,6 +301,7 @@ pub struct FramePhases {
 struct SceneTargets {
     color: GpuImage,
     velocity: GpuImage,
+    surface: GpuImage,
     depth: GpuImage,
 }
 
@@ -190,7 +309,42 @@ struct SceneTargets {
 pub(crate) struct SceneTargets {
     pub(crate) color: GpuImage,
     pub(crate) velocity: GpuImage,
+    pub(crate) surface: GpuImage,
     pub(crate) depth: GpuImage,
+}
+
+/// Which pass a [`DrawCtx`] records. A scene is drawn once per shadow cascade
+/// that is updated this frame, then once for the main pass, then once more
+/// for the transparent pass after the sky and fog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScenePass {
+    /// The lit colour pass (colour, motion vectors and surface data).
+    Main,
+    /// A depth-only pass into one cascade of the sun shadow map.
+    Shadow {
+        /// Index of the cascade being rendered, `0..cascades`.
+        cascade: u32,
+    },
+    /// Alpha-blended geometry, composited over the sky and fog. It loads the
+    /// scene colour, motion vectors and surface data and writes only colour;
+    /// depth is tested but not written.
+    Transparent,
+}
+
+/// Inputs of one frame drawn through [`Renderer::render_scene`].
+pub struct SceneFrame<'a> {
+    /// Camera. Its unjittered matrices fit the shadow cascades.
+    pub camera: &'a Camera,
+    /// Lighting set this frame's shaders read. Keep using the same `Lighting`
+    /// with `render_scene` (the shadow map is bound into it on first use; a
+    /// plain `render` with it afterwards may see a freed map).
+    pub lighting: &'a Lighting,
+    /// Sun and sky. The renderer fills `cam_pos` from `camera`.
+    pub env: LightingEnv,
+    /// Screen rectangle the scene occupies (see [`Renderer::render_ui`]).
+    pub scene_rect: Option<crate::ui::Rect>,
+    /// UI drawn over the composed frame.
+    pub ui: Option<&'a crate::ui::draw::UiFrame>,
 }
 
 /// Draw commands handed to the game for the scene pass.
@@ -205,6 +359,14 @@ pub struct DrawCtx<'a> {
     frame_slot: usize,
     frame_id: u64,
     starter: std::cell::RefCell<Option<&'a mut dyn FnMut()>>,
+    pass: ScenePass,
+    /// The matrix geometry is transformed by in this pass.
+    view_proj: glam::Mat4,
+    /// The occlusion grid the main pass may test against. `None` in shadow passes.
+    occlusion: Option<&'a crate::cull::OcclusionBuffer>,
+    /// Whether a transparent pass follows the main pass in this frame. True
+    /// for [`Renderer::render_scene`](crate::gfx::Renderer::render_scene) only.
+    has_transparent: bool,
 }
 
 /// Draw commands handed to the game for the scene pass (native Metal).
@@ -226,6 +388,9 @@ pub struct DrawCtx<'a> {
     pub(crate) frame_slot: usize,
     pub(crate) frame_id: u64,
     pub(crate) starter: std::cell::RefCell<Option<&'a mut dyn FnMut()>>,
+    pub(crate) pass: ScenePass,
+    pub(crate) view_proj: glam::Mat4,
+    pub(crate) has_transparent: bool,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -248,7 +413,9 @@ pub struct Renderer {
     /// Per frame slot: slot N's set/uniform are only touched after its
     /// fence recycled, so a submitted frame never sees them mutate.
     scene_sets: Vec<vk::DescriptorSet>,
-    blit_set: vk::DescriptorSet,
+    /// Per frame slot, like `scene_sets`: rewritten each frame with the image
+    /// the blit samples (scene colour, FSR output or TAA output).
+    blit_sets: Vec<vk::DescriptorSet>,
 
     sampler: vk::Sampler,
     scene_uniforms: Vec<GpuBuffer>,
@@ -271,13 +438,27 @@ pub struct Renderer {
     /// after a submission succeeds, so a failed frame does not retire slot
     /// resources it never used.
     frame_id: u64,
-    /// Per-slot timestamp query pair bracketing the scene pass (0 = before
-    /// begin_rendering, 1 = after end_rendering). `scene_ms[slot]` holds the
-    /// measured GPU time of the last completed frame on that slot.
+    /// Per-slot timestamps: a pair bracketing the scene pass (0 = before
+    /// begin_rendering, 1 = after end_rendering) and a pair bracketing the post
+    /// work (2 = at the scene's end, 3 = before the blit). `scene_ms[slot]` and
+    /// `post_ms[slot]` hold the measured GPU times of the last completed frame.
     gpu_pool: vk::QueryPool,
+    /// Per-pass GPU timestamps of the scene and post work (see `pass_gpu_ms`).
+    pass_timer: pass_timer::PassTimer,
     scene_ms: Vec<f32>,
+    post_ms: Vec<f32>,
+    shadow_ms: Vec<f32>,
     scene_sample: Option<(u64, f32)>,
     scene_recorded: Vec<bool>,
+    /// Hi-Z occlusion pass, present while `RenderSettings::occlusion` is set.
+    occlusion: Option<hiz::HiZ>,
+    /// The latest occlusion grid read back from the GPU.
+    occlusion_data: Option<Arc<crate::cull::OcclusionBuffer>>,
+    /// Per frame slot: the grid recorded into that slot, with the generation it
+    /// belongs to and what it was rendered with.
+    occlusion_pending: Vec<Option<(u64, crate::cull::OcclusionMeta)>>,
+    /// Bumped whenever occlusion history is dropped, so stale grids are ignored.
+    occlusion_generation: u64,
 
     targets: SceneTargets,
     targets_ready: bool,
@@ -285,6 +466,41 @@ pub struct Renderer {
     thumb: Option<thumbnail::ThumbnailPass>,
     fsr: Option<Fsr3>,
     fsr_enabled: bool,
+    /// Anti-aliasing mode the renderer was asked for (see `set_aa_mode`).
+    aa_mode: AaMode,
+    /// Native-resolution TAA passes, present while `aa_mode` is `Taa` and the
+    /// scene targets exist.
+    taa: Option<taa::Taa>,
+    /// Shared linear depth, present while any screen-space chain is enabled.
+    linear_depth: Option<linear_depth::LinearDepth>,
+    /// Screen-space AO and GI chain, present while either is enabled.
+    indirect: Option<indirect::Indirect>,
+    /// Screen-space reflection chain, present while reflections are enabled.
+    reflection: Option<reflection::Reflection>,
+    /// Physically based sky, present while the atmosphere setting is on.
+    atmosphere: Option<atmosphere::Atmosphere>,
+    /// Volumetric fog, present while the fog setting is on.
+    fog: Option<fog::Fog>,
+    /// Volumetric clouds and their sky panorama, present while the clouds setting is on.
+    clouds: Option<clouds::Clouds>,
+    /// Optional hardware ray-tracing scene. Created only after explicit access
+    /// on a supporting device; UI-only renderers never allocate RT resources.
+    rt_scene: Option<rt::RayTracingScene>,
+    /// CPU atmosphere and the lighting it drives (see `atmosphere::SkyCpu`).
+    sky_cpu: sky_frame::SkyCpu,
+    /// Scene time in seconds: drives the fog noise. Advanced by the frame delta times the scale.
+    scene_time: f64,
+    /// Multiplier on the frame delta that advances [`Self::scene_time`].
+    scene_time_scale: f32,
+    /// Previous frame's rotation-only view-projection, for the sky's velocity.
+    prev_sky_view_proj: glam::Mat4,
+    /// Bumped whenever a screen-space chain is rebuilt; keys the lighting bindings.
+    screen_generation: u64,
+    /// Render scale of the FSR preset, restored when `aa_mode` returns to FSR.
+    fsr_render_scale: f32,
+    /// A swapchain image the acquire worker had already reserved when the GPU
+    /// was quiesced. The next frame presents it instead of acquiring again.
+    parked_token: Option<acquire::Token>,
     /// Composed display image (swapchain format, screen-row order), used only
     /// by frames that cannot be composed straight into the swapchain: a
     /// crosshair, frame capture, or a colour-space change. There the blit
@@ -332,6 +548,20 @@ pub struct Renderer {
     /// default -- waits as long as the presentation engine needs, capped at
     /// the liveness bound (`acquire::UNBUDGETED_WAIT_CAP`).
     frame_wait_budget: Option<Duration>,
+    /// Requested render settings; see [`Renderer::set_render_settings`].
+    render_settings: RenderSettings,
+    /// Sun shadow map, present only while shadows are on and it has been built.
+    shadows: Option<shadow::ShadowMap>,
+    /// Bumped whenever the shadow map is created or dropped, so each `Lighting`
+    /// knows to rebind its shadow binding (see `Lighting::bind_shadow_map`).
+    shadow_generation: u64,
+    /// Set when every cascade must render this frame (first use, settings
+    /// change, resize, history reset); cleared once a frame renders them all.
+    shadow_all_dirty: bool,
+    /// Depth-only variants of the scene pipeline, and of the pulling pipeline
+    /// when one exists.
+    shadow_scene_pipeline: vk::Pipeline,
+    shadow_pulling_pipeline: Option<vk::Pipeline>,
 }
 
 #[cfg(target_os = "macos")]
@@ -388,4 +618,8 @@ pub struct Renderer {
     pub(crate) last_frame: Instant,
     pub(crate) phases: FramePhases,
     pub(crate) frame_wait_budget: Option<Duration>,
+    pub(crate) aa_mode: AaMode,
+    pub(crate) render_settings: RenderSettings,
+    pub(crate) scene_time: f64,
+    pub(crate) scene_time_scale: f32,
 }

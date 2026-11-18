@@ -28,6 +28,12 @@ impl ModelInstance {
         &mut self.player
     }
 
+    /// Whether a clip is attached to this instance's player (see
+    /// [`Player::is_playing`]).
+    pub fn is_animating(&self) -> bool {
+        self.player.is_playing()
+    }
+
     /// Place the instance. The previous transform is captured at the next
     /// [`Self::update`], which is what motion vectors need.
     pub fn set_transform(&mut self, transform: Mat4) {
@@ -43,12 +49,22 @@ impl ModelInstance {
     /// globals are latched here, so draws after this call see correct
     /// (current, previous) motion pairs.
     pub fn update(&mut self, dt: f32) {
+        let moving = self.transform != self.last_transform;
+        let was_moving = self.last_transform != self.prev_transform;
         self.prev_transform = self.last_transform;
         self.last_transform = self.transform;
-        self.player
-            .update(dt, self.model.nodes.len(), &mut self.pose);
-        self.prev_globals = self.globals.clone();
-        self.globals = compute_globals(&self.model, &self.pose, self.transform);
+        let animating = self.player.is_playing();
+        if !animating && !moving && !was_moving && self.prev_globals == self.globals {
+            return;
+        }
+        if animating {
+            self.player
+                .update(dt, self.model.nodes.len(), &mut self.pose);
+        }
+        self.prev_globals.clone_from(&self.globals);
+        if animating || moving {
+            compute_globals_into(&self.model, &self.pose, self.transform, &mut self.globals);
+        }
     }
 
     /// Global (model-space) transform of a node.
@@ -93,6 +109,11 @@ impl ModelInstance {
 /// transform at the roots.
 pub(super) fn compute_globals(model: &Model, pose: &[NodePose], transform: Mat4) -> Vec<Mat4> {
     let mut globals = vec![Mat4::IDENTITY; model.nodes.len()];
+    compute_globals_into(model, pose, transform, &mut globals);
+    globals
+}
+
+fn compute_globals_into(model: &Model, pose: &[NodePose], transform: Mat4, globals: &mut [Mat4]) {
     let mut stack: Vec<(usize, Mat4)> = model.roots.iter().map(|&root| (root, transform)).collect();
     while let Some((index, parent)) = stack.pop() {
         let Some(node) = model.nodes.get(index) else {
@@ -111,5 +132,4 @@ pub(super) fn compute_globals(model: &Model, pose: &[NodePose], transform: Mat4)
             stack.push((child, global));
         }
     }
-    globals
 }
