@@ -429,14 +429,24 @@ impl UiRenderer {
             width: extent.0.max(1) as usize,
             height: extent.1.max(1) as usize,
         };
+        let (sx, sy) = if frame.size.0 > 0.0 && frame.size.1 > 0.0 {
+            let sx = extent.0 as f32 / frame.size.0;
+            let sy = extent.1 as f32 / frame.size.1;
+            (
+                if (sx - 1.0).abs() > 1e-5 { sx } else { 1.0 },
+                if (sy - 1.0).abs() > 1e-5 { sy } else { 1.0 },
+            )
+        } else {
+            (1.0, 1.0)
+        };
         let dirty_scissor = if clear {
             None
         } else {
             frame.dirty_rect.map(|d| {
-                let x0 = (d.x.floor().max(0.0) as usize).min(extent.0 as usize);
-                let y0 = (d.y.floor().max(0.0) as usize).min(extent.1 as usize);
-                let x1 = ((d.x + d.w).ceil().max(0.0) as usize).min(extent.0 as usize);
-                let y1 = ((d.y + d.h).ceil().max(0.0) as usize).min(extent.1 as usize);
+                let x0 = ((d.x * sx).floor().max(0.0) as usize).min(extent.0 as usize);
+                let y0 = ((d.y * sy).floor().max(0.0) as usize).min(extent.1 as usize);
+                let x1 = (((d.x + d.w) * sx).ceil().max(0.0) as usize).min(extent.0 as usize);
+                let y1 = (((d.y + d.h) * sy).ceil().max(0.0) as usize).min(extent.1 as usize);
                 MTLScissorRect {
                     x: x0,
                     y: y0,
@@ -533,10 +543,10 @@ impl UiRenderer {
             self.slots[slot_index].retain(&tex_arc);
 
             let mut scissor = if let Some(c) = cmd_info.scissor {
-                let x0 = (c.x.floor().max(0.0) as usize).min(extent.0 as usize);
-                let y0 = (c.y.floor().max(0.0) as usize).min(extent.1 as usize);
-                let x1 = ((c.x + c.w).ceil().max(0.0) as usize).min(extent.0 as usize);
-                let y1 = ((c.y + c.h).ceil().max(0.0) as usize).min(extent.1 as usize);
+                let x0 = ((c.x * sx).floor().max(0.0) as usize).min(extent.0 as usize);
+                let y0 = ((c.y * sy).floor().max(0.0) as usize).min(extent.1 as usize);
+                let x1 = (((c.x + c.w) * sx).ceil().max(0.0) as usize).min(extent.0 as usize);
+                let y1 = (((c.y + c.h) * sy).ceil().max(0.0) as usize).min(extent.1 as usize);
                 MTLScissorRect {
                     x: x0,
                     y: y0,

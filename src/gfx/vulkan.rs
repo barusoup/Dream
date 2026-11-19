@@ -84,8 +84,14 @@ pub struct GpuContext {
     queue_flags: vk::QueueFlags,
     /// Non-zero when the queue family supports timestamp queries.
     timestamp_valid_bits: u32,
+    /// Nanoseconds per timestamp tick (constant for the device).
+    timestamp_period: f32,
     /// Limits used for clamping arena pages/descriptor ranges.
     max_storage_buffer_range: u32,
+    /// Shared device pipeline cache (seeded from and persisted to disk).
+    pipeline_cache: vk::PipelineCache,
+    pipeline_cache_path: Option<std::path::PathBuf>,
+    pipeline_cache_seed_len: usize,
     /// Samplers, texture set layouts and descriptor pool chunks shared by all
     /// textures of this context (see the `shared` module).
     shared_textures: Mutex<shared::SharedTextureObjects>,
@@ -252,7 +258,7 @@ impl GpuContext {
             physical_device,
             debug_settings: Default::default(),
             buffer_device_address: false,
-            allocation_sizes: gpu_allocator::AllocationSizes::new(8 * 1024 * 1024, 2 * 1024 * 1024),
+            allocation_sizes: gpu_allocator::AllocationSizes::new(4 * 1024 * 1024, 1024 * 1024),
         })
         .expect("create GPU allocator");
 
@@ -275,7 +281,15 @@ impl GpuContext {
         let family_props =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
                 [queue_family as usize];
-        let limits = unsafe { instance.get_physical_device_properties(physical_device) }.limits;
+        let props = unsafe { instance.get_physical_device_properties(physical_device) };
+        let limits = props.limits;
+        let pipeline_cache_path = pipeline_cache_file(&props);
+        let seed_bytes = pipeline_cache_path
+            .as_deref()
+            .and_then(read_pipeline_cache_seed)
+            .unwrap_or_default();
+        let pipeline_cache_seed_len = seed_bytes.len();
+        let pipeline_cache = create_device_pipeline_cache(&device, &seed_bytes);
 
         let ctx = Arc::new(Self {
             _entry: entry,
@@ -301,7 +315,11 @@ impl GpuContext {
             async_ring: Mutex::new(AsyncRing::default()),
             queue_flags: family_props.queue_flags,
             timestamp_valid_bits: family_props.timestamp_valid_bits,
+            timestamp_period: limits.timestamp_period,
             max_storage_buffer_range: limits.max_storage_buffer_range,
+            pipeline_cache,
+            pipeline_cache_path,
+            pipeline_cache_seed_len,
             shared_textures: Default::default(),
             retired_buffers: Mutex::new(Vec::new()),
         });
@@ -372,12 +390,12 @@ impl GpuContext {
 
     /// Nanoseconds per timestamp tick, for converting query results.
     pub fn timestamp_period(&self) -> f32 {
-        unsafe {
-            self.instance
-                .get_physical_device_properties(self.physical_device)
-        }
-        .limits
-        .timestamp_period
+        self.timestamp_period
+    }
+
+    /// Shared device pipeline cache for graphics and compute pipeline creation.
+    pub fn pipeline_cache(&self) -> vk::PipelineCache {
+        self.pipeline_cache
     }
 
     pub fn queue_family(&self) -> u32 {
@@ -477,6 +495,17 @@ impl Drop for GpuContext {
                 self.device.destroy_fence(slot.fence, None);
             }
             self.device.destroy_command_pool(self.transient_pool, None);
+            if self.pipeline_cache != vk::PipelineCache::null() {
+                if let Some(path) = &self.pipeline_cache_path
+                    && let Ok(data) = self.device.get_pipeline_cache_data(self.pipeline_cache)
+                    && !data.is_empty()
+                    && (data.len() != self.pipeline_cache_seed_len || !path.exists())
+                {
+                    persist_pipeline_cache(path, &data);
+                }
+                self.device
+                    .destroy_pipeline_cache(self.pipeline_cache, None);
+            }
             self.destroy_shared_texture_objects();
             // The allocator must release its blocks before the device goes away.
             drop(self.allocator.get_mut().expect("allocator lock").take());
@@ -484,6 +513,65 @@ impl Drop for GpuContext {
             self.surface_loader.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+fn pipeline_cache_file(props: &vk::PhysicalDeviceProperties) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    let dir = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })?
+        .join("dream");
+    #[cfg(windows)]
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(|d| std::path::PathBuf::from(d).join("dream"))?;
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let dir: std::path::PathBuf = return None;
+
+    let mut uuid_hex = String::with_capacity(props.pipeline_cache_uuid.len() * 2);
+    for byte in props.pipeline_cache_uuid {
+        use std::fmt::Write;
+        let _ = write!(uuid_hex, "{byte:02x}");
+    }
+    Some(dir.join(format!(
+        "vk-pipeline-cache-{:04x}-{:04x}-{uuid_hex}.bin",
+        props.vendor_id, props.device_id
+    )))
+}
+
+fn read_pipeline_cache_seed(path: &std::path::Path) -> Option<Vec<u8>> {
+    const MAX_SEED_BYTES: u64 = 64 * 1024 * 1024;
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() == 0 || meta.len() > MAX_SEED_BYTES {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+fn create_device_pipeline_cache(device: &ash::Device, seed: &[u8]) -> vk::PipelineCache {
+    if !seed.is_empty() {
+        let info = vk::PipelineCacheCreateInfo::default().initial_data(seed);
+        if let Ok(cache) = unsafe { device.create_pipeline_cache(&info, None) } {
+            return cache;
+        }
+    }
+    unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }
+        .unwrap_or(vk::PipelineCache::null())
+}
+
+fn persist_pipeline_cache(path: &std::path::Path, data: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("bin.tmp");
+    if std::fs::write(&tmp, data).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 

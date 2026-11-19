@@ -4,6 +4,9 @@
 //! - **Windows:** reads and writes the Win32 clipboard (`CF_UNICODETEXT`,
 //!   UTF-16LE), falling back to an in-process buffer if the clipboard cannot
 //!   be opened (for example in a headless service session).
+//! - **Linux:** reads and writes via `wl-paste` / `wl-copy` on Wayland or
+//!   `xclip` / `xsel` on X11, falling back to an in-process UTF-8 buffer when
+//!   no display clipboard tool is available.
 //! - **Other platforms:** in-process UTF-8 buffer.
 
 use std::sync::Mutex;
@@ -147,7 +150,104 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::io::{ErrorKind, Write};
+    use std::process::{Command, Stdio};
+
+    enum LinuxBackend {
+        Wayland,
+        X11,
+        None,
+    }
+
+    fn backend() -> LinuxBackend {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()) {
+            LinuxBackend::Wayland
+        } else if std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()) {
+            LinuxBackend::X11
+        } else {
+            LinuxBackend::None
+        }
+    }
+
+    fn run_read(program: &str, args: &[&str]) -> Result<Option<String>, ErrorKind> {
+        let out = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|err| err.kind())?;
+        if out.status.success() {
+            Ok(String::from_utf8(out.stdout).ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn run_write(program: &str, args: &[&str], text: &str) -> Result<(), ErrorKind> {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| err.kind())?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        Ok(())
+    }
+
+    pub fn read() -> Option<String> {
+        match backend() {
+            LinuxBackend::Wayland => match run_read("wl-paste", &["--no-newline"]) {
+                Ok(text) => text.or_else(super::fallback_read),
+                Err(_) => super::fallback_read(),
+            },
+            LinuxBackend::X11 => {
+                if let Ok(text) = run_read("xclip", &["-selection", "clipboard", "-o"]) {
+                    return text.or_else(super::fallback_read);
+                }
+                if let Ok(text) = run_read("xsel", &["--clipboard", "--output"]) {
+                    return text.or_else(super::fallback_read);
+                }
+                super::fallback_read()
+            }
+            LinuxBackend::None => super::fallback_read(),
+        }
+    }
+
+    pub fn write(text: &str) {
+        super::fallback_write(text);
+        match backend() {
+            LinuxBackend::Wayland => {
+                if text.is_empty() {
+                    let _ = Command::new("wl-copy")
+                        .arg("--clear")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                } else {
+                    let _ = run_write("wl-copy", &[], text);
+                }
+            }
+            LinuxBackend::X11 => {
+                if matches!(
+                    run_write("xclip", &["-selection", "clipboard", "-i"], text),
+                    Err(ErrorKind::NotFound)
+                ) {
+                    let _ = run_write("xsel", &["--clipboard", "--input"], text);
+                }
+            }
+            LinuxBackend::None => {}
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod imp {
     pub fn read() -> Option<String> {
         super::fallback_read()

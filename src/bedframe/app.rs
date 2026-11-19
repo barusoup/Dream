@@ -441,6 +441,13 @@ struct Runner<A> {
     last_cursor: Option<CursorIcon>,
     /// Fingerprint of the last presented UI-only frame (to skip no-op submits).
     last_presented_sig: Option<(u64, u64, usize, usize, usize)>,
+    /// Consecutive `SurfaceError::Timeout` retries (used to back off on occluded Wayland surfaces).
+    consecutive_timeouts: u32,
+    timeout_until: Option<Instant>,
+    /// Last time `is_minimized` was polled (throttled so X11 doesn't round-trip per cursor move).
+    last_window_poll: Option<Instant>,
+    window_minimised: bool,
+    wayland: bool,
     /// The handle [`AppContext::waker`] clones from.
     waker: AppWaker,
 }
@@ -452,6 +459,8 @@ impl<A: UiApp> Runner<A> {
         exit_at: Option<Instant>,
         proxy: EventLoopProxy<WakeEvent>,
     ) -> Self {
+        let wayland = cfg!(target_os = "linux")
+            && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
         Self {
             options,
             app,
@@ -483,6 +492,11 @@ impl<A: UiApp> Runner<A> {
             ime_allowed: false,
             last_cursor: None,
             last_presented_sig: None,
+            consecutive_timeouts: 0,
+            timeout_until: None,
+            last_window_poll: None,
+            window_minimised: false,
+            wayland,
         }
     }
 
@@ -554,6 +568,9 @@ impl<A: UiApp> Runner<A> {
             return;
         }
         let now = Instant::now();
+        if self.timeout_until.is_some_and(|until| now < until) && !self.dirty {
+            return;
+        }
         let was_dirty = self.dirty;
         let mut input = std::mem::take(&mut self.pending);
         input.dt = frame_dt(self.last_frame.map(|at| now.duration_since(at)));
@@ -598,7 +615,11 @@ impl<A: UiApp> Runner<A> {
         }
         self.animating = live.ui.animating();
         let wake = live.ui.next_wake_in();
-        let frame_sig = frame.content_signature();
+        let frame_sig = if self.animating {
+            None
+        } else {
+            frame.content_signature()
+        };
         if !self.animating
             && self.last_presented_sig.is_some()
             && frame_sig == self.last_presented_sig
@@ -619,10 +640,23 @@ impl<A: UiApp> Runner<A> {
             self.last_presented_sig = None;
             match classify_frame_failure(err) {
                 FrameFailure::Retry => {
-                    self.dirty = true;
+                    self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+                    let backoff =
+                        Duration::from_millis(100 * u64::from(self.consecutive_timeouts.min(5)));
+                    let wake_at = Instant::now() + backoff;
+                    self.timeout_until = Some(wake_at);
+                    self.ui_wake = earliest(self.ui_wake, Some(wake_at));
+                    if self.consecutive_timeouts == 3 {
+                        live.renderer.trim_memory();
+                        if self.options.idle_trim {
+                            trim_working_set();
+                        }
+                    }
                     return;
                 }
                 FrameFailure::Recreate => {
+                    self.consecutive_timeouts = 0;
+                    self.timeout_until = None;
                     live.renderer.recreate_swapchain();
                     self.dirty = true;
                     return;
@@ -634,6 +668,8 @@ impl<A: UiApp> Runner<A> {
                 }
             }
         }
+        self.consecutive_timeouts = 0;
+        self.timeout_until = None;
         self.last_presented_sig = frame_sig;
         let done = Instant::now();
         if was_dirty {
@@ -781,6 +817,8 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
         // Any event but a redraw is user activity, which restarts the quiet
         // period before the next idle trim.
         self.memory.activity(Instant::now());
+        self.consecutive_timeouts = 0;
+        self.timeout_until = None;
         match event {
             WindowEvent::Resized(size) => {
                 // Minimising reports 0x0. Keep the last real size; the window
@@ -790,6 +828,7 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
                         live.renderer.resize(size);
                     }
                     self.refresh_cache = None;
+                    self.last_window_poll = None;
                     self.last_presented_sig = None;
                     self.dirty = true;
                 }
@@ -798,14 +837,22 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
                 self.scale = sanitize_scale(scale_factor);
                 if let Some(live) = self.live.as_mut() {
                     live.ui.set_scale(self.scale);
-                    live.renderer.resize(live.window.inner_size());
+                    let size = live.window.inner_size();
+                    if size.width > 0
+                        && size.height > 0
+                        && (size.width, size.height) != live.renderer.display_size()
+                    {
+                        live.renderer.resize(size);
+                    }
                 }
                 self.refresh_cache = None;
+                self.last_window_poll = None;
                 self.last_presented_sig = None;
                 self.dirty = true;
             }
             WindowEvent::Moved(_) => {
                 self.refresh_cache = None;
+                self.last_window_poll = None;
             }
             WindowEvent::ThemeChanged(theme) => {
                 self.system_dark = theme == WinitTheme::Dark;
@@ -914,28 +961,45 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
-        // Minimisation has no event on most platforms, so it is polled here.
-        let minimised = self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.window.is_minimized() == Some(true));
-        self.set_hidden(self.occluded || minimised);
-
         let now = Instant::now();
+        // Minimisation has no event on most platforms, so it is polled at low
+        // cadence off Wayland (Wayland never answers `is_minimized()`).
+        if !self.wayland
+            && self
+                .last_window_poll
+                .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(250))
+        {
+            self.window_minimised = self
+                .live
+                .as_ref()
+                .is_some_and(|live| live.window.is_minimized() == Some(true));
+            self.last_window_poll = Some(now);
+        }
+        self.set_hidden(self.occluded || self.window_minimised);
+
         let trim_at = if self.hidden || !self.options.idle_trim {
             None
         } else {
-            self.memory.trim_if_due(now);
+            if self.memory.trim_if_due(now)
+                && let Some(live) = self.live.as_mut()
+            {
+                live.renderer.trim_memory();
+            }
             self.memory.next_deadline()
         };
-        let anim_due = self.next_anim_due(now);
+        let throttled = self.timeout_until.is_some_and(|until| now < until);
+        let anim_due = if throttled {
+            None
+        } else {
+            self.next_anim_due(now)
+        };
         let decision = schedule(ScheduleInput {
             now,
             hidden: self.hidden,
-            dirty: self.dirty,
-            animating: self.animating,
+            dirty: self.dirty && !throttled,
+            animating: self.animating && !throttled,
             anim_due,
-            ui_wake: self.ui_wake,
+            ui_wake: earliest(self.ui_wake, self.timeout_until),
             trim_at,
             exit_at: self.exit_at,
         });

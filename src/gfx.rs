@@ -233,16 +233,18 @@ pub struct Renderer {
     ctx: Arc<GpuContext>,
     swapchain: vulkan::Swapchain,
 
-    scene_pipeline: vk::Pipeline,
+    scene_pipeline: Option<vk::Pipeline>,
+    scene_shader_src: String,
     scene_layout: vk::PipelineLayout,
     scene_dsl: vk::DescriptorSetLayout,
     /// Vertex-pulling pipeline variant: zero vertex input, quad storage at
     /// set 1, a 16-byte vertex-stage origin push constant. Present only when
     /// the renderer was built by [`Self::new_with_pulling`].
     pulling: Option<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout)>,
-    blit_pipeline: vk::Pipeline,
+    blit_pipeline: Option<vk::Pipeline>,
     blit_layout: vk::PipelineLayout,
     blit_dsl: vk::DescriptorSetLayout,
+    display_fmt: vk::Format,
     descriptor_pool: vk::DescriptorPool,
 
     /// Per frame slot: slot N's set/uniform are only touched after its
@@ -304,7 +306,7 @@ pub struct Renderer {
     present_mode: vulkan::PresentMode,
     /// Set once a readback has found no retained frame and said so.
     capture_notice: bool,
-    present_pipeline: vk::Pipeline,
+    present_pipeline: Option<vk::Pipeline>,
     present_layout: vk::PipelineLayout,
     present_set: vk::DescriptorSet,
     /// UI overlay pass; recorded between the blit and the present pass.
