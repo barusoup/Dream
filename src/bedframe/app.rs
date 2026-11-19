@@ -62,7 +62,8 @@
 //!   set is trimmed once after start-up and once after each quiet period. See
 //!   [`crate::memory::IdleTrim`].
 //! - **Input.** Mouse, wheel, keyboard, IME and clipboard are translated for
-//!   you. Keyboard focus rings are on.
+//!   you. Keyboard focus rings are on. Files dropped on the window arrive
+//!   through [`UiApp::files_dropped`].
 //!
 //! - **Cursor icons.** Widgets set [`Ui::cursor`] automatically (for text
 //!   fields, splitters and sliders) and [`run`] forwards it to the window;
@@ -215,6 +216,12 @@ pub trait UiApp {
     /// frame, so record state from events (`if resp.clicked { … }`) rather
     /// than assigning it from a response.
     fn view(&mut self, ui: &mut Ui, cx: &mut AppContext<'_>);
+
+    /// Files were dropped on the window. A drop of several files arrives as
+    /// one call with them in the order the OS listed them; drops that land
+    /// before the next frame are coalesced. The frame that follows this call
+    /// shows whatever the app made of the paths.
+    fn files_dropped(&mut self, _paths: Vec<std::path::PathBuf>, _cx: &mut AppContext<'_>) {}
 
     /// The window's close button was pressed. Return `false` to keep the app
     /// running. The default closes the window.
@@ -413,6 +420,9 @@ struct Runner<A> {
     left_down: bool,
     right_down: bool,
     preedit: Option<Composition>,
+    /// Paths the OS dropped on the window since the last frame that forwarded
+    /// them to [`UiApp::files_dropped`]. A multi-file drop coalesces here.
+    drops: Vec<std::path::PathBuf>,
     /// Physical pixels per logical point.
     scale: f32,
     /// The OS reported the window's appearance as dark.
@@ -477,6 +487,7 @@ impl<A: UiApp> Runner<A> {
             left_down: false,
             right_down: false,
             preedit: None,
+            drops: Vec::new(),
             scale: 1.0,
             system_dark: true,
             occluded: false,
@@ -590,6 +601,10 @@ impl<A: UiApp> Runner<A> {
         let screen = logical_size(live.renderer.display_size(), scale);
         live.ui.begin(input, screen);
         live.ui.set_theme(&live.theme);
+        if !self.drops.is_empty() {
+            let paths = std::mem::take(&mut self.drops);
+            self.with_app(|app, _ui, cx| app.files_dropped(paths, cx));
+        }
         self.with_app(|app, ui, cx| app.view(ui, cx));
 
         let Some(live) = self.live.as_mut() else {
@@ -951,6 +966,19 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
                     Ime::Enabled => {}
                 }
                 self.dirty = true;
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.drops.push(path);
+                self.dirty = true;
+            }
+            // The drag ending is the OS saying the last file has been dropped,
+            // so the whole drop can be forwarded now rather than waiting for
+            // the next frame to coalesce it.
+            WindowEvent::HoveredFileCancelled => {
+                if !self.drops.is_empty() {
+                    let paths = std::mem::take(&mut self.drops);
+                    self.with_app(|app, _ui, cx| app.files_dropped(paths, cx));
+                }
             }
             _ => {}
         }
