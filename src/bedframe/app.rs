@@ -69,6 +69,10 @@
 //!   fields, splitters and sliders) and [`run`] forwards it to the window;
 //!   custom code can override it via [`Ui::set_cursor`].
 //!
+//! - **Linux desktop integration.** [`AppOptions::app_id`] sets the Wayland
+//!   `app_id` and X11 `WM_CLASS`, so the window matches its `.desktop` entry
+//!   for its icon and launcher grouping.
+//!
 //! # Environment
 //!
 //! `DREAM_APP_AUTOCLOSE_MS=<ms>` makes [`run`] return after that many
@@ -128,6 +132,11 @@ pub struct AppOptions {
     /// [`GpuPreference::HighPerformance`]; UI-only apps on hybrid laptops can
     /// opt into [`GpuPreference::LowPower`] via [`AppOptions::low_power_gpu`].
     pub gpu_preference: GpuPreference,
+    /// Application ID for the Linux desktop: the Wayland `app_id` and the X11
+    /// `WM_CLASS`, used to match the window to its `.desktop` entry (icon,
+    /// launcher grouping, `StartupWMClass`). Default `None`, which leaves the
+    /// compositor's fallback. Ignored on other platforms.
+    pub app_id: Option<String>,
 }
 
 impl Default for AppOptions {
@@ -142,6 +151,7 @@ impl Default for AppOptions {
             ui_blend: UiBlend::default(),
             idle_trim: true,
             gpu_preference: GpuPreference::HighPerformance,
+            app_id: None,
         }
     }
 }
@@ -164,6 +174,12 @@ impl AppOptions {
     /// Set the colour palette.
     pub fn theme(mut self, theme: ThemeMode) -> Self {
         self.theme = theme;
+        self
+    }
+
+    /// Set the Linux application ID (Wayland `app_id` / X11 `WM_CLASS`).
+    pub fn app_id(mut self, app_id: impl Into<String>) -> Self {
+        self.app_id = Some(app_id.into());
         self
     }
 
@@ -774,6 +790,18 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
         if let Some((width, height)) = self.options.min_size {
             attributes = attributes
                 .with_min_inner_size(LogicalSize::new(f64::from(width), f64::from(height)));
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if let Some(app_id) = self.options.app_id.as_deref() {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            // The backend is chosen by the event loop before this point, so
+            // the same ID is fed to whichever of the two traits applies.
+            attributes = if self.wayland {
+                WindowAttributesExtWayland::with_name(attributes, app_id, app_id)
+            } else {
+                WindowAttributesExtX11::with_name(attributes, app_id, app_id)
+            };
         }
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
