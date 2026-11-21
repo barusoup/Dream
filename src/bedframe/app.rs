@@ -470,10 +470,9 @@ struct Runner<A> {
     /// Consecutive `SurfaceError::Timeout` retries (used to back off on occluded Wayland surfaces).
     consecutive_timeouts: u32,
     timeout_until: Option<Instant>,
-    /// Last time `is_minimized` was polled (throttled so X11 doesn't round-trip per cursor move).
+    /// Last time `is_minimized` was polled.
     last_window_poll: Option<Instant>,
     window_minimised: bool,
-    wayland: bool,
     /// The handle [`AppContext::waker`] clones from.
     waker: AppWaker,
 }
@@ -485,8 +484,6 @@ impl<A: UiApp> Runner<A> {
         exit_at: Option<Instant>,
         proxy: EventLoopProxy<WakeEvent>,
     ) -> Self {
-        let wayland = cfg!(target_os = "linux")
-            && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
         Self {
             options,
             app,
@@ -523,7 +520,6 @@ impl<A: UiApp> Runner<A> {
             timeout_until: None,
             last_window_poll: None,
             window_minimised: false,
-            wayland,
         }
     }
 
@@ -791,18 +787,6 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
             attributes = attributes
                 .with_min_inner_size(LogicalSize::new(f64::from(width), f64::from(height)));
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        if let Some(app_id) = self.options.app_id.as_deref() {
-            use winit::platform::wayland::WindowAttributesExtWayland;
-            use winit::platform::x11::WindowAttributesExtX11;
-            // The backend is chosen by the event loop before this point, so
-            // the same ID is fed to whichever of the two traits applies.
-            attributes = if self.wayland {
-                WindowAttributesExtWayland::with_name(attributes, app_id, app_id)
-            } else {
-                WindowAttributesExtX11::with_name(attributes, app_id, app_id)
-            };
-        }
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(err) => {
@@ -969,15 +953,8 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
-                // The platform shortcut modifier: Command on macOS, Control
-                // elsewhere.
-                let command = if cfg!(target_os = "macos") {
-                    state.super_key()
-                } else {
-                    state.control_key()
-                };
                 self.keys
-                    .modifiers(state.shift_key(), command, state.alt_key());
+                    .modifiers(state.shift_key(), state.control_key(), state.alt_key());
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 self.keyboard(&event);
@@ -1018,12 +995,10 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
             return;
         }
         let now = Instant::now();
-        // Minimisation has no event on most platforms, so it is polled at low
-        // cadence off Wayland (Wayland never answers `is_minimized()`).
-        if !self.wayland
-            && self
-                .last_window_poll
-                .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(250))
+        // Minimisation has no event on Windows, so it is polled at low cadence.
+        if self
+            .last_window_poll
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(250))
         {
             self.window_minimised = self
                 .live
